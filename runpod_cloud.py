@@ -124,10 +124,7 @@ def create_runpod_worker_bundle(project_root: Path, artifact_root: Path, bundle_
     source_package = "engine"
     source_root = project_root / source_package
     if not source_root.is_dir():
-        # Keep bundles usable for older checkouts while new bundles use the
-        # canonical engine package.
-        source_package = "llm_trainer"
-        source_root = project_root / source_package
+        raise FileNotFoundError(f"Engine package not found: {source_root}")
     with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         _write_tree(archive, source_root, f"worker_src/{source_package}")
         archive.writestr("worker_src/requirements.txt", _worker_requirements(project_root))
