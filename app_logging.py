@@ -3,14 +3,28 @@
 import logging
 import faulthandler
 from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
+import platform
 import sys
 import threading
 import traceback
 from typing import Optional
 
 
-DEFAULT_LOG_DIR = Path.home() / ".drunkenbot_ide" / "logs"
+def default_log_dir() -> Path:
+    """Return the platform-standard DrunkenBot log directory."""
+    system = platform.system()
+    if system == "Windows":
+        root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return root / "DrunkenBot-IDE" / "logs"
+    if system == "Darwin":
+        return Path.home() / "Library" / "Logs" / "DrunkenBot-IDE"
+    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return root / "DrunkenBot-IDE" / "logs"
+
+
+DEFAULT_LOG_DIR = default_log_dir()
 DEFAULT_LOG_PATH = DEFAULT_LOG_DIR / "drunkenbot_ide.log"
 _FAULT_LOG_HANDLE: Optional[object] = None
 _CONFIGURED_PATH: Optional[Path] = None
@@ -114,4 +128,3 @@ def _enable_fault_logging(active_path: Path) -> None:
     fault_path = active_path.with_name("drunkenbot_ide_faults.log")
     _FAULT_LOG_HANDLE = fault_path.open("a", encoding="utf-8")
     faulthandler.enable(file=_FAULT_LOG_HANDLE, all_threads=True)
-
