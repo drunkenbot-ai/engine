@@ -72,6 +72,19 @@ class ProtocolEnvelope:
         }
 
 
+def _restore_envelope(message: ProtocolEnvelope, data: dict[str, Any]) -> None:
+    """Restore envelope fields on a protocol message.
+
+    Args:
+        message: Protocol message.
+        data: Serialized message data.
+    """
+
+    message.message_id = data.get("message_id", message.message_id)
+    message.sent_at = data.get("sent_at", message.sent_at)
+    message.protocol_version = data.get("protocol_version", message.protocol_version)
+
+
 @dataclass
 class WorkerCapabilities:
     """Hardware and runtime capabilities advertised by a worker.

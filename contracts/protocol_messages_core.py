@@ -9,6 +9,7 @@ from engine.contracts.jobs import BackendKind, TrainingJobSpec, TrainingMetrics,
 
 
 from .protocol_types import *
+from .protocol_types import _restore_envelope
 class RegisterWorkerRequest(ProtocolEnvelope):
     """Request sent by a worker to join the coordinator."""
 
