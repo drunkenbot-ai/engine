@@ -38,6 +38,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     Returns:
         Training result with checkpoint and summary paths.
     """
+    training_started_at = perf_counter()
     model_config.validate()
     training_config.validate()
     set_seed(training_config.seed)
@@ -172,7 +173,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                 save_checkpoint(stopped_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch, final_train_loss, final_val_loss)
                 emit_progress(progress, f'Training stopped. Resume checkpoint saved: {stopped_path}', 100)
                 summary_path = training_config.output_dir / 'training_summary.json'
-                summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'total_steps': global_step, 'stopped': True, 'resume_checkpoint': str(stopped_path), 'parameters': sum((p.numel() for p in model.parameters()))}
+                summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'total_steps': global_step, 'stopped': True, 'resume_checkpoint': str(stopped_path), 'parameters': sum((p.numel() for p in model.parameters())), 'elapsed_seconds': perf_counter() - training_started_at}
                 summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
                 return TrainingResult(stopped_path, summary_path, final_train_loss, final_val_loss, stopped=True)
             x = x.to(training_config.device, non_blocking=pin_memory)
@@ -221,7 +222,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                     except Exception:
                         sample_text = None
                 current_progress = 8 + int(86 * min(global_step, total_steps) / max(total_steps, 1))
-                emit_progress(progress, f'Epoch {epoch + 1}/{training_config.epochs}, step {global_step}/{total_steps}, loss {float(loss.item() * training_config.gradient_accumulation):.4f}', current_progress, epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=float(loss.item() * training_config.gradient_accumulation), val_loss=final_val_loss, learning_rate=learning_rate, grad_norm=grad_norm, weight_norm=weight_norm, update_ratio=update_ratio, tokens_per_second=tokens_seen / step_seconds, samples_per_second=samples_seen / step_seconds, step_seconds=step_seconds, average_step_seconds=average_step_seconds, eta_seconds=eta_seconds, remaining_steps=remaining_steps, vram_allocated_gb=vram_allocated_gb, vram_reserved_gb=vram_reserved_gb, gpu_memory_percent=gpu_memory_percent, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent(), data_loader_workers=loader_workers, sample_text=sample_text)
+                emit_progress(progress, f'Epoch {epoch + 1}/{training_config.epochs}, step {global_step}/{total_steps}, loss {float(loss.item() * training_config.gradient_accumulation):.4f}', current_progress, epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=float(loss.item() * training_config.gradient_accumulation), val_loss=final_val_loss, learning_rate=learning_rate, grad_norm=grad_norm, weight_norm=weight_norm, update_ratio=update_ratio, tokens_per_second=tokens_seen / step_seconds, samples_per_second=samples_seen / step_seconds, step_seconds=step_seconds, average_step_seconds=average_step_seconds, elapsed_seconds=perf_counter() - training_started_at, eta_seconds=eta_seconds, remaining_steps=remaining_steps, vram_allocated_gb=vram_allocated_gb, vram_reserved_gb=vram_reserved_gb, gpu_memory_percent=gpu_memory_percent, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent(), data_loader_workers=loader_workers, sample_text=sample_text)
                 if val_loader is not None and training_config.eval_interval > 0 and (global_step % training_config.eval_interval == 0):
                     emit_progress(progress, f'Running validation at step {global_step}...', current_progress, epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=float(loss.item() * training_config.gradient_accumulation), val_loss=final_val_loss, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent())
                     final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, current_progress)
@@ -275,7 +276,9 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     summary_path = training_config.output_dir / 'training_summary.json'
     summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'best_val_loss': best_val_loss, 'best_checkpoint_path': str(best_checkpoint_path) if best_checkpoint_path else None, 'recommended_checkpoint_path': str(best_checkpoint_path or checkpoint_path), 'total_steps': global_step, 'parameters': sum((p.numel() for p in model.parameters())), 'adapter_checkpoint': str(training_config.output_dir / 'final_adapter.pt') if training_config.peft_method == 'lora' else None, 'early_stopped': early_stopped}
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
-    emit_progress(progress, 'Training stopped early - validation loss converged.' if early_stopped else 'Training complete.', 100, epoch=training_config.epochs, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss)
+    elapsed_seconds = perf_counter() - training_started_at
+    summary['elapsed_seconds'] = elapsed_seconds
+    emit_progress(progress, 'Training stopped early - validation loss converged.' if early_stopped else 'Training complete.', 100, epoch=training_config.epochs, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss, elapsed_seconds=elapsed_seconds)
     return TrainingResult(checkpoint_path, summary_path, final_train_loss, final_val_loss)
 from .training_resume import _release_cuda_cache, _configure_cuda_allocator, _estimated_training_vram_bytes
 from .training_checkpoint import save_checkpoint
