@@ -240,7 +240,7 @@ def read_jsonl(path: Path) -> str:
         path: JSONL file path.
 
     Returns:
-        Combined text from string rows or common text fields.
+        Combined text from string rows or structured dataset fields.
     """
 
     chunks: list[str] = []
@@ -251,10 +251,10 @@ def read_jsonl(path: Path) -> str:
             value = json.loads(line)
             if isinstance(value, str):
                 chunks.append(value)
-            elif isinstance(value, dict):
-                for key in ("text", "content", "prompt", "completion"):
-                    if key in value and value[key]:
-                        chunks.append(str(value[key]))
+            else:
+                text = _extract_structured_text(value, "instruction")
+                if text:
+                    chunks.append(text)
     return "\n".join(chunks)
 
 
