@@ -2,6 +2,7 @@
 import re
 from typing import Any, Optional
 
+
 def _bounded_ratio(value: float, target: float) -> float:
     """Return value/target clamped between 0 and 1.
 

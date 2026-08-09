@@ -13,6 +13,7 @@ from .manifest_store import ManifestStore
 from .dataset_corpus import _StreamingCorpusBuilder
 from .dataset_helpers import _emit, _cache_key, _local_structured_dataset_paths
 
+
 def _load_documents_with_cache(
         config: DatasetConfig,
         corpus_builder: "_StreamingCorpusBuilder",

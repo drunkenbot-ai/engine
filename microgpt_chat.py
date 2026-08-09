@@ -8,9 +8,9 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from engine.config import ModelConfig
-from engine.model import MicroGPT
-from engine.tokenizer import EOS_TOKEN, load_tokenizer, token_id
+from .config import ModelConfig
+from .model import MicroGPT
+from .tokenizer import EOS_TOKEN, load_tokenizer, token_id
 
 
 class MicroGPTChatSession:

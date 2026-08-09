@@ -7,6 +7,7 @@ from .config import DatasetConfig
 
 LOGGER = logging.getLogger(__name__)
 
+
 def _local_structured_dataset_paths(config: DatasetConfig) -> list[
     tuple[Path, str, str]]:
     """Return configured local structured dataset paths.

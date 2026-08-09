@@ -3,10 +3,9 @@
 import json
 import re
 import hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import PyPDF2
 
