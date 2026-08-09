@@ -495,6 +495,10 @@ def _structured_record_error(record: Any, kind: str) -> str | None:
                          record.get("utterances", record.get("turns")))))
         if value is not None and (not isinstance(value, list) or not value):
             return "conversation messages must be a non-empty array"
+        if value is None and "role" in record and not any(
+                record.get(key) for key in ("prompt", "question", "text", "body")
+        ):
+            return "standalone role/content object is not a conversation record"
         if value is None and not any(record.get(key) for key in ("prompt", "question", "text", "content", "body")):
             return "missing conversation messages or text fields"
     elif kind == "instruction":
