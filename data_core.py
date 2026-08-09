@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import logging
 import re
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import PyPDF2
+
+LOGGER = logging.getLogger(__name__)
 
 
 class OperationCancelled(RuntimeError):
@@ -418,7 +421,8 @@ def _extract_structured_text(record: Any, kind: str) -> str:
     return ""
 
 
-def load_structured_json_documents(path: Path, kind: str, lowercase: bool = False) -> list[Document]:
+def load_structured_json_documents(path: Path, kind: str, lowercase: bool = False,
+                                   on_invalid: Callable[[str], None] | None = None) -> list[Document]:
     """Load conversation or instruction samples from JSON/JSONL files.
 
     Args:
@@ -447,7 +451,18 @@ def load_structured_json_documents(path: Path, kind: str, lowercase: bool = Fals
     for file_path in files:
         if file_path.suffix.lower() not in {".json", ".jsonl"}:
             raise ValueError(f"Unsupported structured dataset file: {file_path}")
-        for index, record in enumerate(_iter_json_records(file_path), start=1):
+        for index, record, error in _iter_json_records_with_errors(file_path):
+            if error:
+                LOGGER.warning("%s:%s: %s", file_path, index, error)
+                if on_invalid:
+                    on_invalid(f"Skipped {file_path.name}, line/record {index}: {error}.")
+                continue
+            validation_error = _structured_record_error(record, kind)
+            if validation_error:
+                LOGGER.warning("%s:%s: %s", file_path, index, validation_error)
+                if on_invalid:
+                    on_invalid(f"Skipped {file_path.name}, line/record {index}: {validation_error}.")
+                continue
             text = _extract_structured_text(record, kind)
             text = clean_code(text, lowercase=lowercase)
             if not text:
@@ -461,6 +476,66 @@ def load_structured_json_documents(path: Path, kind: str, lowercase: bool = Fals
                 )
             )
     return documents
+
+
+def _structured_record_error(record: Any, kind: str) -> str | None:
+    """Return a concise reason when a structured training record is unusable."""
+    if not isinstance(record, (dict, list, str)):
+        return f"expected a JSON object, array, or string, got {type(record).__name__}"
+    if isinstance(record, str):
+        return None if record.strip() else "empty string record"
+    if isinstance(record, list):
+        if not record:
+            return "empty message list"
+        if kind == "instruction":
+            return "instruction records must be objects, not message arrays"
+        return None
+    if kind == "conversation":
+        value = record.get("messages", record.get("conversations", record.get("dialogue",
+                         record.get("utterances", record.get("turns")))))
+        if value is not None and (not isinstance(value, list) or not value):
+            return "conversation messages must be a non-empty array"
+        if value is None and not any(record.get(key) for key in ("prompt", "question", "text", "content", "body")):
+            return "missing conversation messages or text fields"
+    elif kind == "instruction":
+        if not any(record.get(key) for key in ("instruction", "input", "output", "response",
+                                                "answer", "completion", "prompt", "question", "text",
+                                                "content", "body")):
+            return "missing instruction/input/output or text fields"
+    elif kind == "tool_call":
+        messages = record.get("messages")
+        if messages is not None and (not isinstance(messages, list) or not messages):
+            return "tool_call messages must be a non-empty array"
+        if not any(record.get(key) is not None for key in ("messages", "tools", "tool_calls",
+                                                            "tool_results", "prompt", "text", "content")):
+            return "missing tools, messages, tool_calls, or text fields"
+    return None
+
+
+def _iter_json_records_with_errors(path: Path):
+    """Yield (record number, record, error) while isolating malformed JSON rows."""
+    if path.suffix.lower() == ".jsonl":
+        with path.open("r", encoding="utf-8") as file:
+            for line_number, line in enumerate(file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    yield line_number, json.loads(line), None
+                except json.JSONDecodeError as exc:
+                    yield line_number, None, f"invalid JSON ({exc.msg})"
+        return
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        yield 1, None, f"invalid JSON ({exc.msg})"
+        return
+    values = value if isinstance(value, list) else next(
+        (value[key] for key in ("data", "examples", "items", "records", "rows")
+         if isinstance(value, dict) and isinstance(value.get(key), list)),
+        [value],
+    )
+    for index, record in enumerate(values, start=1):
+        yield index, record, None
 
 
 def read_supported_document(

@@ -326,7 +326,8 @@ def _load_documents_with_cache(
         _emit(progress, f"Loading {label} JSON/JSONL dataset: {local_path}",
               42)
         local_documents = load_structured_json_documents(local_path, kind=kind,
-                                                         lowercase=config.lowercase)
+                                                         lowercase=config.lowercase,
+                                                         on_invalid=lambda message: _emit(progress, message, 42))
         for document in local_documents:
             corpus_builder.submit(document)
         local_document_count = len(local_documents)
@@ -429,5 +430,4 @@ def _load_documents_with_cache(
         skipped_count,
         failed_count,
     )
-
 
