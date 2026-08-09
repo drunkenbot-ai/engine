@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import shutil
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -55,6 +56,29 @@ def create_job_artifact_bundle(
     job.metadata["artifact_bundle_url"] = f"{base_url.rstrip('/')}/{bundle_path.name}"
     job.metadata["artifact_bundle_name"] = bundle_path.name
     return bundle_path
+
+
+def create_job_project_tree(job: TrainingJobSpec, artifact_root: Optional[Path] = None, base_url: str = "/artifacts") -> Path:
+    """Materialize a file-addressable project tree for hash-delta workers.
+
+    The zip remains a compatibility fallback; new workers fetch a manifest and
+    only download files whose SHA-256 differs from their local cache.
+    """
+    root = Path(artifact_root) if artifact_root else default_artifact_root()
+    project_id = str(job.metadata.get("project_id") or job.job_id)
+    tree = root / "projects" / project_id
+    if tree.exists():
+        shutil.rmtree(tree)
+    (tree / "dataset").mkdir(parents=True, exist_ok=True)
+    for source in Path(job.dataset.dataset_dir).rglob("*"):
+        if source.is_file():
+            target = tree / "dataset" / source.relative_to(job.dataset.dataset_dir)
+            target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(source, target)
+    (tree / "job.json").write_text(json.dumps(job.to_jsonable(), indent=2), encoding="utf-8")
+    job.metadata["project_id"] = project_id
+    job.metadata["project_manifest_url"] = f"{base_url.rstrip('/')}/projects/{project_id}/tree-manifest"
+    job.metadata["project_base_url"] = f"{base_url.rstrip('/')}/projects/{project_id}"
+    return tree
 
 
 def create_result_artifact_bundle(job_id: str, output_dir: Path, bundle_path: Path) -> Path:

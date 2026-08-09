@@ -3,7 +3,9 @@
 from pathlib import Path
 from typing import Any, Optional
 
-from .data_core import (Document, SUPPORTED_CODE_SUFFIXES, clean_text, read_supported_document, load_structured_json_documents, supported_source_paths, OperationCancelled)
+from .data_core import (Document, clean_text, read_supported_document,
+                        supported_source_paths, OperationCancelled)
+
 
 def is_code_like_line(line: str) -> bool:
     """Estimate whether a line appears to be source code.

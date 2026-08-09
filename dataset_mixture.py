@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .conversation_datasets import CONVERSATION_DATASET_PRESETS
-from .data import Document, SUPPORTED_CODE_SUFFIXES
+from .data import Document
 
 LOGGER = logging.getLogger(__name__)
 

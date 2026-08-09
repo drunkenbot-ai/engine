@@ -9,15 +9,17 @@ import numpy as np
 from .config import DatasetConfig, dataclass_to_jsonable
 from .data import file_sha256
 from .dataset_corpus import _StreamingCorpusBuilder
-from .dataset_helpers import _emit, _local_structured_dataset_paths
+from .dataset_helpers import _emit
 from .dataset_loader import _load_documents_with_cache
 from .dataset_mixture import MAX_REPETITIVE_UNIT_RATIO
 from .dataset_quality import _dataset_quality_report
 from .dataset_tokenizer import _load_or_create_tokenizer
 from .lineage import record_dataset_version, write_json
-from .tokenizer import encode_file_to_npy, save_tokenizer_package, token_dtype_for_vocab, validate_training_tokenizer
+from .tokenizer import encode_file_to_npy, save_tokenizer_package, \
+    token_dtype_for_vocab, validate_training_tokenizer
 
 LOGGER = logging.getLogger(__name__)
+
 
 @dataclass
 class DatasetBuildResult:
@@ -144,6 +146,8 @@ def content_warning(character_count: int) -> Optional[str]:
     if character_count < 100_000:
         return "The corpus is modest. Use more text for better generations and reasoning behavior."
     return None
+
+
 def build_dataset(
         config: DatasetConfig,
         progress: Optional[Callable[[Any], None]] = None,
@@ -185,7 +189,8 @@ def build_dataset(
         processed_file_count,
         skipped_file_count,
         failed_file_count,
-    ) = _load_documents_with_cache(config, corpus_builder, progress, should_stop)
+    ) = _load_documents_with_cache(config, corpus_builder, progress,
+                                   should_stop)
     duplicate_report = corpus_builder.close()
     stats = corpus_builder.stats
     if should_stop and should_stop():
@@ -296,13 +301,16 @@ def build_dataset(
     token_dtype = token_dtype_for_vocab(tokenizer.get_vocab_size())
     all_tokens_path = config.output_dir / "all_tokens.npy"
     token_count = encode_file_to_npy(
-        tokenizer, corpus_path, all_tokens_path, token_dtype, should_stop=should_stop
+        tokenizer, corpus_path, all_tokens_path, token_dtype,
+        should_stop=should_stop
     )
     _emit(progress, f"Encoded {token_count:,} tokens.", 86)
 
-    token_density = (token_count / max(character_count, 1)) if character_count else 0.0
+    token_density = (token_count / max(character_count,
+                                       1)) if character_count else 0.0
     document_token_lengths = [max(1, int(round(char_len * token_density)))
-                              for char_len in stats.document_char_lengths if char_len]
+                              for char_len in stats.document_char_lengths if
+                              char_len]
     if document_token_lengths:
         sequence_stats = {
             "min": min(document_token_lengths),

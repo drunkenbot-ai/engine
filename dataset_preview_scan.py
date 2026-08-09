@@ -6,7 +6,7 @@ from pathlib import Path
 from .config import DatasetConfig
 from .conversation_datasets import CONVERSATION_DATASET_PRESETS
 from .data import file_fingerprint, load_structured_json_documents
-from .dataset_build import _local_structured_dataset_paths
+from .dataset_helpers import _local_structured_dataset_paths
 from .lineage import read_json, write_json
 from .dataset_preview_health import (
     DatasetPreviewResult,
@@ -20,6 +20,8 @@ from .dataset_preview_health import (
     _readiness_report,
     _supported_source_paths_cancellable,
 )
+
+
 def scan_dataset_preview(
     config: DatasetConfig,
     sample_limit: int = 8,

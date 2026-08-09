@@ -31,8 +31,26 @@ from engine.contracts import (
     utc_now_iso,
 )
 from engine.coordinator.state_store import JobStateStore
-from engine.coordinator.job_models import ManagedJob, WorkerDescriptor, WorkerStatus
+from engine.coordinator.job_models import ManagedJob, WorkerDescriptor, WorkerHeartbeat, WorkerStatus
 from engine.training import TrainingResult
+
+
+def _availability_to_worker_status(availability: WorkerAvailability) -> WorkerStatus:
+    """Convert the wire-level availability enum into stored worker status."""
+    return {
+        WorkerAvailability.AVAILABLE: WorkerStatus.AVAILABLE,
+        WorkerAvailability.BUSY: WorkerStatus.BUSY,
+        WorkerAvailability.OFFLINE: WorkerStatus.OFFLINE,
+    }[availability]
+
+
+def _control_message(should_stop: bool, should_pause: bool, default: str) -> str:
+    """Return the remote worker control state as a human-readable message."""
+    if should_stop:
+        return "stop requested"
+    if should_pause:
+        return "pause requested"
+    return default
 
 
 class JobManagerCore:

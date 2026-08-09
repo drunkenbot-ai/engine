@@ -65,12 +65,18 @@ class WorkerClientConfig:
     execute_jobs: bool = False
     claim_once: bool = False
     workspace_dir: Path = field(default_factory=lambda: Path.home() / ".drunkenbot_ide" / "worker_workspace")
+    # Local and cloud are separate farm workflows, but execute the same
+    # remote-worker training implementation. This declares which queue the
+    # worker is eligible to claim from.
+    backend: BackendKind = BackendKind.LOCAL
+    # Required only for cloud-mode registration and job submission routes.
+    api_key: Optional[str] = None
 
 
 class CoordinatorHttpClient:
     """Small JSON HTTP client for the coordinator API."""
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, api_key: Optional[str] = None) -> None:
         """Create an HTTP client.
 
         Args:
@@ -78,6 +84,13 @@ class CoordinatorHttpClient:
         """
 
         self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+
+    def _headers(self, headers: Optional[dict[str, str]] = None) -> dict[str, str]:
+        result = dict(headers or {})
+        if self.api_key:
+            result["Authorization"] = f"Bearer {self.api_key}"
+        return result
 
     def get(self, path: str) -> dict[str, Any]:
         """Send a GET request.
@@ -89,7 +102,7 @@ class CoordinatorHttpClient:
             JSON response payload.
         """
 
-        with urlopen(f"{self.base_url}{path}", timeout=10) as response:
+        with urlopen(Request(f"{self.base_url}{path}", headers=self._headers()), timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -106,7 +119,7 @@ class CoordinatorHttpClient:
         request = Request(
             f"{self.base_url}{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=self._headers({"Content-Type": "application/json"}),
             method="POST",
         )
         with urlopen(request, timeout=30) as response:
@@ -121,7 +134,10 @@ class CoordinatorHttpClient:
         """
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with urlopen(self.absolute_url(path_or_url), timeout=300) as response, output_path.open("wb") as output:
+        offset = output_path.stat().st_size if output_path.exists() else 0
+        headers = {"Range": f"bytes={offset}-"} if offset else {}
+        request = Request(self.absolute_url(path_or_url), headers=self._headers(headers))
+        with urlopen(request, timeout=300) as response, output_path.open("ab" if response.status == 206 else "wb") as output:
             while chunk := response.read(1024 * 1024):
                 output.write(chunk)
 
@@ -140,10 +156,10 @@ class CoordinatorHttpClient:
         request = Request(
             self.absolute_url(path_or_url),
             data=data,
-            headers={
+            headers=self._headers({
                 "Content-Type": "application/octet-stream",
                 "Content-Length": str(len(data)),
-            },
+            }),
             method="PUT",
         )
         with urlopen(request, timeout=300) as response:

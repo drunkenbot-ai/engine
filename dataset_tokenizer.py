@@ -6,6 +6,7 @@ from .config import DatasetConfig
 from .dataset_helpers import _emit
 from .tokenizer import load_tokenizer, train_tokenizer
 
+
 def _resolve_tokenizer_strategy(config: DatasetConfig, tokenizer_path: Path) -> \
 tuple[str, bool]:
     """Resolve tokenizer strategy into an executable mode.

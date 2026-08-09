@@ -3,18 +3,8 @@
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-import json
 import logging
-import os
-from pathlib import Path
-from queue import Empty, Queue
-import subprocess
-import sys
-from threading import Thread
-from typing import Any, Callable, Optional
-
-from engine.data import Document, clean_text
-
+from typing import Optional
 
 LOGGER = logging.getLogger(__name__)
 
@@ -233,6 +223,7 @@ def dataset_stage_label(stage: str) -> str:
         "instruction": "Instruction fine-tune",
         "conversation": "Conversation fine-tune",
         "code": "Code fine-tune",
+        "tool_call": "Tool-call fine-tune",
     }.get(stage, "Custom")
 
 

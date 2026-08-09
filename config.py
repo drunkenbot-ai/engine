@@ -30,14 +30,14 @@ class DatasetConfig:
         prepare_mode: Dataset update mode: incremental, full_rebuild, or force_reprocess.
         tokenizer_strategy: Tokenizer policy: auto, train_new, reuse_dataset, or import_tokenizer.
         tokenizer_path: Optional existing tokenizer JSON used by import_tokenizer.
-        dataset_stage: Intended dataset purpose: base, instruction, conversation, or code.
+        dataset_stage: Intended dataset purpose: base, instruction, conversation, code, or tool_call.
         conversation_datasets: Built-in Hugging Face conversation dataset IDs to include.
         conversation_sample_limit: Maximum rows to read from each selected conversation dataset. Zero means no limit.
         conversation_dataset_path: Optional local JSON/JSONL file or folder containing conversation samples.
         instruction_dataset_path: Optional local JSON/JSONL file or folder containing instruction samples.
         conversation_dataset_paths: Local JSON/JSONL files or folders containing conversation samples.
         instruction_dataset_paths: Local JSON/JSONL files or folders containing instruction samples.
-        tool_call_dataset_paths: Local OpenAI-style tool-call JSON/JSONL files or folders.
+        tool_call_dataset_paths: Local JSON/JSONL files or folders containing OpenAI-style tool-call samples.
         default_data_paths: Bundled starter data files selected from the Dataset Blueprint panel.
         mixture_weights: Planned dataset mixture percentages by source family.
         fast_scan_mode: Uses sampled fingerprints for faster large-corpus scans.

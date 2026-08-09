@@ -1,9 +1,8 @@
 ﻿from __future__ import annotations
-from typing import Any, Callable, Optional
-import torch
-import torch.nn.functional as F
 from .training_runtime import *
 from .training_resume import _release_cuda_cache
+
+
 def evaluate(
     model: MicroGPT,
     loader: DataLoader,

@@ -9,6 +9,7 @@ from engine.contracts.jobs import BackendKind, TrainingJobSpec, TrainingMetrics,
 
 
 from .protocol_types import *
+from .protocol_types import _restore_envelope
 @dataclass
 class CompleteJobRequest(ProtocolEnvelope):
     """Completion report sent by a worker."""
@@ -185,19 +186,6 @@ class FailJobResponse(ProtocolEnvelope):
             "status": self.status.value,
             "message": self.message,
         }
-
-
-def _restore_envelope(message: ProtocolEnvelope, data: dict[str, Any]) -> None:
-    """Restore envelope fields on a protocol message.
-
-    Args:
-        message: Protocol message.
-        data: Serialized message data.
-    """
-
-    message.message_id = data.get("message_id", message.message_id)
-    message.sent_at = data.get("sent_at", message.sent_at)
-    message.protocol_version = data.get("protocol_version", message.protocol_version)
 
 
 def _result_to_jsonable(result: TrainingResultSpec) -> dict[str, Any]:

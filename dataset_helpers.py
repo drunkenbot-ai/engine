@@ -7,6 +7,7 @@ from .config import DatasetConfig
 
 LOGGER = logging.getLogger(__name__)
 
+
 def _local_structured_dataset_paths(config: DatasetConfig) -> list[
     tuple[Path, str, str]]:
     """Return configured local structured dataset paths.
@@ -88,8 +89,7 @@ def _cache_key(config: DatasetConfig) -> str:
                                            config.conversation_dataset_paths],
             "instruction_dataset_paths": [str(path) for path in
                                           config.instruction_dataset_paths],
-            "tool_call_dataset_paths": [str(path) for path in
-                                        config.tool_call_dataset_paths],
+            "tool_call_dataset_paths": [str(path) for path in config.tool_call_dataset_paths],
             "default_data_paths": [str(path) for path in
                                    config.default_data_paths],
         },
