@@ -332,10 +332,21 @@ def _format_message_list(messages: Any) -> str:
         role = _role_name(item.get("role", item.get("from", item.get("speaker", item.get("author")))))
         content = item.get("content", item.get("value", item.get("text", item.get("message", ""))))
         if isinstance(content, list):
-            content = " ".join(str(part) for part in content if part)
+            content = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
         content_text = str(content or "").strip()
+        details: list[str] = []
         if content_text:
-            lines.append(f"{role}: {content_text}")
+            details.append(content_text)
+        # Do not discard structured tool calls or tool results.  JSON is used
+        # deliberately so arguments and result payloads remain unambiguous.
+        if item.get("tool_calls") is not None:
+            details.append("tool_calls=" + json.dumps(item["tool_calls"], ensure_ascii=False, separators=(",", ":")))
+        if item.get("tool_call_id") is not None:
+            details.append("tool_call_id=" + str(item["tool_call_id"]))
+        if item.get("name") is not None:
+            details.append("name=" + str(item["name"]))
+        if details:
+            lines.append(f"{role}: {' '.join(details)}")
     return "\n".join(lines)
 
 
@@ -360,7 +371,23 @@ def _extract_structured_text(record: Any, kind: str) -> str:
     for message_key in ("messages", "conversations", "dialogue", "utterances", "turns"):
         transcript = _format_message_list(record.get(message_key))
         if transcript:
+            if record.get("tools") is not None:
+                transcript = (
+                    "Tools: " + json.dumps(record["tools"], ensure_ascii=False, separators=(",", ":"))
+                    + "\n" + transcript
+                )
             return transcript
+
+    # OpenAI tool definitions are part of the training example context even
+    # when the record has no textual messages.
+    tools = record.get("tools")
+    if tools is not None:
+        tool_text = "Tools: " + json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+        for key in ("messages", "tool_calls", "tool_results"):
+            value = record.get(key)
+            if value is not None and key != "messages":
+                tool_text += f"\n{key}: " + json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return tool_text
 
     instruction = str(record.get("instruction", "") or "").strip()
     user_input = str(record.get("input", "") or "").strip()
@@ -492,6 +519,4 @@ def read_supported_document(
     if not text:
         return None
     return Document(path=path, text=text)
-
-
 

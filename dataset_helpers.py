@@ -36,6 +36,13 @@ def _local_structured_dataset_paths(config: DatasetConfig) -> list[
         if key not in seen:
             seen.add(key)
             items.append((Path(path), "instruction", "local instruction"))
+    for path in config.tool_call_dataset_paths:
+        if path is None or not str(path).strip():
+            continue
+        key = ("tool_call", str(Path(path)))
+        if key not in seen:
+            seen.add(key)
+            items.append((Path(path), "tool_call", "local tool-call"))
     return items
 def _emit(progress: Optional[Callable[[Any], None]], message: str,
           percent: Optional[int] = None) -> None:
@@ -81,9 +88,10 @@ def _cache_key(config: DatasetConfig) -> str:
                                            config.conversation_dataset_paths],
             "instruction_dataset_paths": [str(path) for path in
                                           config.instruction_dataset_paths],
+            "tool_call_dataset_paths": [str(path) for path in
+                                        config.tool_call_dataset_paths],
             "default_data_paths": [str(path) for path in
                                    config.default_data_paths],
         },
         sort_keys=True,
     )
-
