@@ -223,6 +223,7 @@ def dataset_stage_label(stage: str) -> str:
         "instruction": "Instruction fine-tune",
         "conversation": "Conversation fine-tune",
         "code": "Code fine-tune",
+        "tool_call": "Tool-call fine-tune",
     }.get(stage, "Custom")
 
 
