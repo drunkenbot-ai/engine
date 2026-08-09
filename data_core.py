@@ -1,19 +1,17 @@
 ﻿from __future__ import annotations
 
+import hashlib
 import json
 import re
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 import PyPDF2
 
-
+from .tool_call_data import format_tool_call_record
 class OperationCancelled(RuntimeError):
     """Raised when a long-running operation is cancelled by the user."""
-
-
 SUPPORTED_TEXT_SUFFIXES = {".txt", ".md", ".text"}
 SUPPORTED_CODE_SUFFIXES = {
     ".py": "python",
@@ -349,6 +347,9 @@ def _extract_structured_text(record: Any, kind: str) -> str:
         Extracted sample text, or an empty string.
     """
 
+    tool_call_text = format_tool_call_record(record)
+    if tool_call_text:
+        return tool_call_text
     if isinstance(record, str):
         return record.strip()
     if isinstance(record, list):

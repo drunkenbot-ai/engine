@@ -30,13 +30,14 @@ class DatasetConfig:
         prepare_mode: Dataset update mode: incremental, full_rebuild, or force_reprocess.
         tokenizer_strategy: Tokenizer policy: auto, train_new, reuse_dataset, or import_tokenizer.
         tokenizer_path: Optional existing tokenizer JSON used by import_tokenizer.
-        dataset_stage: Intended dataset purpose: base, instruction, conversation, or code.
+        dataset_stage: Intended dataset purpose: base, instruction, conversation, code, or tool_call.
         conversation_datasets: Built-in Hugging Face conversation dataset IDs to include.
         conversation_sample_limit: Maximum rows to read from each selected conversation dataset. Zero means no limit.
         conversation_dataset_path: Optional local JSON/JSONL file or folder containing conversation samples.
         instruction_dataset_path: Optional local JSON/JSONL file or folder containing instruction samples.
         conversation_dataset_paths: Local JSON/JSONL files or folders containing conversation samples.
         instruction_dataset_paths: Local JSON/JSONL files or folders containing instruction samples.
+        tool_call_dataset_paths: Local JSON/JSONL files or folders containing OpenAI-style tool-call samples.
         default_data_paths: Bundled starter data files selected from the Dataset Blueprint panel.
         mixture_weights: Planned dataset mixture percentages by source family.
         fast_scan_mode: Uses sampled fingerprints for faster large-corpus scans.
@@ -76,6 +77,7 @@ class DatasetConfig:
     instruction_dataset_path: Optional[Path] = None
     conversation_dataset_paths: list[Path] = field(default_factory=list)
     instruction_dataset_paths: list[Path] = field(default_factory=list)
+    tool_call_dataset_paths: list[Path] = field(default_factory=list)
     default_data_paths: list[Path] = field(default_factory=list)
     mixture_weights: dict[str, float] = field(default_factory=dict)
     fast_scan_mode: bool = False

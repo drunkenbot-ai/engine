@@ -65,6 +65,7 @@ def prepare(args: argparse.Namespace) -> None:
         dataset_stage=args.dataset_stage,
         conversation_datasets=[item.strip() for item in args.conversation_datasets.split(",") if item.strip()],
         conversation_sample_limit=args.conversation_sample_limit,
+        tool_call_dataset_paths=[Path(path) for path in args.tool_call_dataset.split(",") if path.strip()],
         fast_scan_mode=args.fast_scan_mode,
         fast_scan_sample_bytes=args.fast_scan_sample_bytes,
         strict_duplicate_verification=args.strict_duplicate_verification,
@@ -279,9 +280,14 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--tokenizer_path", default=None)
     prepare_parser.add_argument(
         "--dataset_stage",
-        choices=["base", "instruction", "conversation"],
+        choices=["base", "instruction", "conversation", "code", "tool_call"],
         default="base",
-        help="Purpose for online datasets: base pretraining, instruction fine-tune, or conversation fine-tune.",
+        help="Dataset purpose, including local tool-call fine-tune examples.",
+    )
+    prepare_parser.add_argument(
+        "--tool_call_dataset",
+        default="",
+        help="Comma-separated JSON/JSONL paths containing OpenAI-style tool-call examples.",
     )
     prepare_parser.add_argument(
         "--conversation_datasets",
