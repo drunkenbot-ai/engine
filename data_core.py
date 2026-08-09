@@ -434,6 +434,8 @@ def load_structured_json_documents(path: Path, kind: str, lowercase: bool = Fals
         ValueError: If the file type is unsupported.
     """
 
+    if kind not in {"conversation", "instruction", "tool_call"}:
+        raise ValueError(f"Unsupported structured dataset kind: {kind}")
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Structured dataset path does not exist: {path}")
@@ -519,4 +521,3 @@ def read_supported_document(
     if not text:
         return None
     return Document(path=path, text=text)
-
