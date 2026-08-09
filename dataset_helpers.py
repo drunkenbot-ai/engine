@@ -38,7 +38,7 @@ def _local_structured_dataset_paths(config: DatasetConfig) -> list[
             seen.add(key)
             items.append((Path(path), "instruction", "local instruction"))
     for path in config.tool_call_dataset_paths:
-        if not str(path).strip():
+        if path is None or not str(path).strip():
             continue
         key = ("tool_call", str(Path(path)))
         if key not in seen:
@@ -95,4 +95,3 @@ def _cache_key(config: DatasetConfig) -> str:
         },
         sort_keys=True,
     )
-

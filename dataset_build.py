@@ -402,7 +402,8 @@ def build_dataset(
                                        config.conversation_dataset_paths],
         "instruction_dataset_paths": [str(path) for path in
                                       config.instruction_dataset_paths],
-        "tool_call_dataset_paths": [str(path) for path in config.tool_call_dataset_paths],
+        "tool_call_dataset_paths": [str(path) for path in
+                                    config.tool_call_dataset_paths],
         "default_data_paths": [str(path) for path in
                                config.default_data_paths],
         "mixture_weights": config.mixture_weights,
@@ -484,6 +485,4 @@ def build_dataset(
         float(duplicate_report["unique_block_ratio"]),
     )
 
-
-__all__ = ["DatasetBuildResult", "build_dataset", "estimate_vocab_size",
-           "content_warning"]
+__all__ = ["DatasetBuildResult", "build_dataset", "estimate_vocab_size", "content_warning"]
