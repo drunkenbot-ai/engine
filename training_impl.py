@@ -24,6 +24,29 @@ from .training_runtime import *
 from .training_evaluation import *
 from .training_resume import *
 
+def _export_final_artifacts(
+    model: MicroGPT,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: GradScaler,
+    model_config: ModelConfig,
+    training_config: TrainingConfig,
+    global_step: int,
+    train_loss: float,
+    val_loss: Optional[float],
+    progress: Optional[Callable[[Any], None]] = None,
+) -> tuple[Path, Optional[Path]]:
+    """Write the chat-loadable final model while retaining a LoRA adapter export."""
+    adapter_path = None
+    if training_config.peft_method == "lora":
+        adapter_path = training_config.output_dir / "final_adapter.pt"
+        save_checkpoint(adapter_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, train_loss, val_loss)
+        merged_count = merge_lora_adapters(model)
+        emit_progress(progress, f"Merged {merged_count} LoRA adapter module(s) into final model weights.", 96)
+    checkpoint_path = training_config.output_dir / "final_model.pt"
+    save_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, train_loss, val_loss)
+    return checkpoint_path, adapter_path
+
 def train_model(model_config: ModelConfig, training_config: TrainingConfig, train_tokens: Union[list[int], np.ndarray], val_tokens: Union[list[int], np.ndarray], pad_token_id: int, progress: Optional[Callable[[Any], None]]=None, should_stop: Optional[Callable[[], bool]]=None, decode_preview: Optional[Callable[[list[int]], str]]=None) -> TrainingResult:
     """Train a MicroGPT model.
     Args:
@@ -170,9 +193,10 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                 final_train_loss = sum(epoch_losses) / max(len(epoch_losses), 1) if epoch_losses else final_train_loss
                 stopped_path = checkpoints_dir / f'checkpoint_stopped_step_{global_step}.pt'
                 save_checkpoint(stopped_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch, final_train_loss, final_val_loss)
+                final_checkpoint_path, adapter_path = _export_final_artifacts(model, optimizer, scheduler, scaler, model_config, training_config, global_step, final_train_loss, final_val_loss, progress)
                 emit_progress(progress, f'Training stopped. Resume checkpoint saved: {stopped_path}', 100)
                 summary_path = training_config.output_dir / 'training_summary.json'
-                summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'total_steps': global_step, 'stopped': True, 'resume_checkpoint': str(stopped_path), 'parameters': sum((p.numel() for p in model.parameters()))}
+                summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'total_steps': global_step, 'stopped': True, 'resume_checkpoint': str(stopped_path), 'recommended_checkpoint_path': str(final_checkpoint_path), 'adapter_checkpoint': str(adapter_path) if adapter_path else None, 'parameters': sum((p.numel() for p in model.parameters()))}
                 summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
                 return TrainingResult(stopped_path, summary_path, final_train_loss, final_val_loss, stopped=True)
             x = x.to(training_config.device, non_blocking=pin_memory)
@@ -265,13 +289,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         emit_progress(progress, f'Epoch {epoch + 1} complete. Checkpoint saved.', 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)), epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent())
         if early_stopped:
             break
-    if training_config.peft_method == 'lora':
-        adapter_path = training_config.output_dir / 'final_adapter.pt'
-        save_checkpoint(adapter_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, final_train_loss, final_val_loss)
-        merged_count = merge_lora_adapters(model)
-        emit_progress(progress, f'Merged {merged_count} LoRA adapter module(s) into final model weights.', 96)
-    checkpoint_path = training_config.output_dir / 'final_model.pt'
-    save_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, final_train_loss, final_val_loss)
+    checkpoint_path, adapter_path = _export_final_artifacts(model, optimizer, scheduler, scaler, model_config, training_config, global_step, final_train_loss, final_val_loss, progress)
     summary_path = training_config.output_dir / 'training_summary.json'
     summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'best_val_loss': best_val_loss, 'best_checkpoint_path': str(best_checkpoint_path) if best_checkpoint_path else None, 'recommended_checkpoint_path': str(best_checkpoint_path or checkpoint_path), 'total_steps': global_step, 'parameters': sum((p.numel() for p in model.parameters())), 'adapter_checkpoint': str(training_config.output_dir / 'final_adapter.pt') if training_config.peft_method == 'lora' else None, 'early_stopped': early_stopped}
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
