@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from engine.config import DatasetConfig
-from engine.data_core import load_structured_json_documents
+from engine.data_core import load_jsonl_documents, load_structured_json_documents
 from engine.dataset_helpers import _local_structured_dataset_paths
 from engine.tool_call_data import format_tool_call_record
 
@@ -38,6 +38,21 @@ def test_formats_openai_tool_calls_and_results() -> None:
     assert "<tool_calls>" in text
     assert '"id":"call_1"' in text
     assert '<tool_result id="call_1">' in text
+
+
+def test_load_jsonl_documents_keeps_each_record_separate(tmp_path: Path) -> None:
+    """JSONL records must receive independent paths for per-record filtering."""
+    source = tmp_path / "records.jsonl"
+    source.write_text(
+        '{"messages":[{"role":"user","content":"First"},{"role":"assistant","content":"One"}]}\n'
+        '{"messages":[{"role":"user","content":"Second"},{"role":"assistant","content":"Two"}]}\n',
+        encoding="utf-8",
+    )
+
+    documents = load_jsonl_documents(source)
+
+    assert [document.path.name for document in documents] == ["records.jsonl#1", "records.jsonl#2"]
+    assert all(document.kind == "conversation" for document in documents)
 
 
 def test_structured_loader_marks_tool_call_documents(tmp_path: Path) -> None:

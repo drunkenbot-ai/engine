@@ -258,6 +258,33 @@ def read_jsonl(path: Path) -> str:
     return "\n".join(chunks)
 
 
+def load_jsonl_documents(path: Path, lowercase: bool = False) -> list[Document]:
+    """Load each JSONL record as an independent training document."""
+    documents: list[Document] = []
+    for index, record, error in _iter_json_records_with_errors(path):
+        if error:
+            LOGGER.warning("%s:%s: %s", path, index, error)
+            continue
+        kind = "tool_call" if isinstance(record, dict) and any(
+            key in record for key in ("tool_calls", "tool_results", "tools")
+        ) else "conversation" if isinstance(record, (dict, list)) and (
+            isinstance(record, list) or any(
+                key in record for key in ("messages", "conversations", "dialogue", "turns")
+            )
+        ) else "instruction"
+        text = clean_text(_extract_structured_text(record, kind), lowercase=lowercase)
+        if text:
+            documents.append(
+                Document(
+                    path=Path(f"{path}#{index}"),
+                    text=text,
+                    kind=kind,
+                    language="local_json",
+                )
+            )
+    return documents
+
+
 def _iter_json_records(path: Path) -> list[Any]:
     """Read JSON or JSONL records from a file.
 
