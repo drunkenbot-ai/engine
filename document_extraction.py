@@ -20,6 +20,7 @@ from .data import (
     Document,
     document_to_dict,
     expand_code_documents,
+    load_jsonl_documents,
     read_supported_document,
 )
 
@@ -101,6 +102,14 @@ def extract_documents_worker(
     """
 
     try:
+        if path.suffix.lower() == ".jsonl":
+            source_documents = load_jsonl_documents(path, lowercase=lowercase)
+            return {
+                "path": str(path),
+                "documents": [document_to_dict(doc) for doc in source_documents],
+                "error": None,
+                "bad_extraction_reasons": [],
+            }
         source_doc = read_supported_document(
             path,
             lowercase=lowercase,
