@@ -1,6 +1,14 @@
 ﻿from __future__ import annotations
-from .training_runtime import *
+
+from typing import Any, Callable, Optional
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from .model import MicroGPT
 from .training_resume import _release_cuda_cache
+from .training_runtime import emit_progress, system_cpu_percent, system_ram_percent
 
 
 class TrainingStopRequested(RuntimeError):

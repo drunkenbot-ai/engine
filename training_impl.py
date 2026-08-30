@@ -1,28 +1,46 @@
 ﻿from __future__ import annotations
 import json
 import math
-import os
-import random
-from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Optional, Union
+
 import numpy as np
-import numpy.lib.format as npy_format
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+
 from .config import ModelConfig, TrainingConfig, dataclass_to_jsonable
-from .model import MicroGPT, apply_lora_adapters, freeze_non_lora_parameters, load_lora_state_dict, lora_parameter_count, lora_state_dict, merge_lora_adapters
-try:
-    import psutil
-except ImportError:
-    psutil = None
-from .training_core import *
-from .training_runtime import *
-from .training_evaluation import *
-from .training_resume import *
+from .model import (
+    MicroGPT,
+    apply_lora_adapters,
+    freeze_non_lora_parameters,
+    load_lora_state_dict,
+    lora_parameter_count,
+    merge_lora_adapters,
+)
+from .training_checkpoint import save_checkpoint
+from .training_evaluation import TrainingStopRequested, evaluate
+from .training_resume import (
+    _configure_cuda_allocator,
+    _estimated_training_vram_bytes,
+    _release_cuda_cache,
+    check_resume_compatibility,
+    latest_checkpoint,
+)
+from .training_runtime import (
+    ResumeCompatibilityReport,
+    TokenDataset,
+    TrainingResult,
+    amp_settings,
+    emit_progress,
+    make_optimizer,
+    make_scheduler,
+    set_seed,
+    system_cpu_percent,
+    system_ram_percent,
+)
 from .training_telemetry import TelemetryCadence
 
 
@@ -379,5 +397,3 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
     emit_progress(progress, 'Training stopped early - validation loss converged.' if early_stopped else 'Training complete.', 100, event_type='completion', epoch=training_config.epochs, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss)
     return TrainingResult(checkpoint_path, summary_path, final_train_loss, final_val_loss)
-from .training_resume import _release_cuda_cache, _configure_cuda_allocator, _estimated_training_vram_bytes
-from .training_checkpoint import save_checkpoint
