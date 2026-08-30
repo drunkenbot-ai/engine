@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
@@ -48,6 +49,14 @@ class NotifierConfig:
     progress_interval_seconds: int = 60
     telegram: TelegramNotifierConfig = field(default_factory=TelegramNotifierConfig)
     email: EmailNotifierConfig = field(default_factory=EmailNotifierConfig)
+
+
+@dataclass(frozen=True)
+class _PendingNotification:
+    kind: str
+    stage_key: str
+    subject: str
+    text: str
 
 
 def default_notifier_config_path(project_dir: Optional[Path] = None) -> Path:
@@ -115,7 +124,13 @@ class NotificationManager:
     be edited after delivery.
     """
 
-    def __init__(self, config_path: Path) -> None:
+    def __init__(
+        self,
+        config_path: Path,
+        max_pending: int = 32,
+        config_check_interval_seconds: float = 2.0,
+        minimum_progress_interval_seconds: float = 10.0,
+    ) -> None:
         """Initialize the notification manager.
 
         Args:
@@ -126,8 +141,26 @@ class NotificationManager:
         self.config = load_notifier_config(self.config_path)
         self._last_progress_at: dict[str, float] = {}
         self._telegram_message_ids: dict[str, int] = {}
-        self._lock = threading.RLock()
+        self._condition = threading.Condition(threading.RLock())
+        self._delivery_lock = threading.RLock()
+        self._pending_progress: OrderedDict[str, _PendingNotification] = OrderedDict()
+        self._terminal_notifications: deque[_PendingNotification] = deque()
+        self._max_pending = max(1, int(max_pending))
+        self._config_check_interval_seconds = max(0.0, float(config_check_interval_seconds))
+        self._minimum_progress_interval_seconds = max(
+            0.0,
+            float(minimum_progress_interval_seconds),
+        )
+        self._last_config_check_at = time.monotonic()
+        self._config_mtime_ns = self._read_config_mtime()
+        self._accepting = True
         self._disabled_warning_logged = False
+        self._dispatcher = threading.Thread(
+            target=self._dispatch_loop,
+            name="training-notifier",
+            daemon=True,
+        )
+        self._dispatcher.start()
 
     @property
     def enabled(self) -> bool:
@@ -157,7 +190,11 @@ class NotificationManager:
     def reload(self) -> None:
         """Reload notifier_config.json from disk."""
 
-        self.config = load_notifier_config(self.config_path)
+        with self._delivery_lock:
+            self.config = load_notifier_config(self.config_path)
+            self._config_mtime_ns = self._read_config_mtime()
+            self._last_config_check_at = time.monotonic()
+            self._disabled_warning_logged = False
 
     def notify_progress(self, stage_key: str, title: str, lines: list[str], percent: Optional[int] = None) -> None:
         """Send or edit a throttled progress notification.
@@ -169,18 +206,24 @@ class NotificationManager:
             percent: Optional progress percent.
         """
 
-        self.reload()
+        self._reload_if_changed()
         if not self.enabled:
             self._log_disabled()
             return
-        now = time.time()
-        interval = max(10, int(self.config.progress_interval_seconds or 60))
-        last = self._last_progress_at.get(stage_key, 0.0)
-        if now - last < interval:
-            return
-        self._last_progress_at[stage_key] = now
         text = self._format_message(title, lines, percent)
-        self._submit(lambda: self._send_progress(stage_key, f"{title} progress", text))
+        notification = _PendingNotification("progress", stage_key, f"{title} progress", text)
+        with self._condition:
+            if not self._accepting:
+                return
+            if stage_key in self._pending_progress:
+                self._pending_progress[stage_key] = notification
+                self._pending_progress.move_to_end(stage_key)
+            elif self._pending_count_locked() < self._max_pending:
+                self._pending_progress[stage_key] = notification
+            elif self._pending_progress:
+                self._pending_progress.popitem(last=False)
+                self._pending_progress[stage_key] = notification
+            self._condition.notify()
 
     def notify_complete(self, stage_key: str, title: str, lines: list[str]) -> None:
         """Send a completion summary immediately.
@@ -191,12 +234,12 @@ class NotificationManager:
             lines: Body lines.
         """
 
-        self.reload()
+        self._reload_if_changed()
         if not self.enabled:
             self._log_disabled()
             return
         text = self._format_message(title, lines, 100)
-        self._submit(lambda: self._send_completion(stage_key, title, text))
+        self._enqueue_terminal(_PendingNotification("complete", stage_key, title, text))
 
     def notify_failure(self, stage_key: str, title: str, message: str) -> None:
         """Send a failure summary immediately.
@@ -207,12 +250,27 @@ class NotificationManager:
             message: Failure message.
         """
 
-        self.reload()
+        self._reload_if_changed()
         if not self.enabled:
             self._log_disabled()
             return
         text = self._format_message(title, [message], None)
-        self._submit(lambda: self._send_completion(stage_key, title, text))
+        self._enqueue_terminal(_PendingNotification("failure", stage_key, title, text))
+
+    def close(self, timeout: Optional[float] = 5.0) -> None:
+        """Stop accepting work and wait for queued notifications to finish."""
+
+        with self._condition:
+            self._accepting = False
+            self._condition.notify_all()
+        self._dispatcher.join(timeout=timeout)
+
+    @property
+    def pending_count(self) -> int:
+        """Return queued progress and terminal notification count."""
+
+        with self._condition:
+            return self._pending_count_locked()
 
     def _send_progress(self, stage_key: str, subject: str, text: str) -> None:
         """Dispatch a progress notification to enabled channels."""
@@ -233,7 +291,7 @@ class NotificationManager:
     def _send_or_edit_telegram(self, stage_key: str, text: str) -> None:
         """Send a new Telegram message or edit the existing stage message."""
 
-        with self._lock:
+        with self._delivery_lock:
             message_id = self._telegram_message_ids.get(stage_key)
             if message_id is None:
                 response = self._telegram_post(
@@ -306,16 +364,102 @@ class NotificationManager:
                     smtp_ssl.login(email.username, email.password)
                 smtp_ssl.send_message(message)
 
-    def _submit(self, fn) -> None:
-        """Run notification delivery without blocking the UI thread."""
+    def _enqueue_terminal(self, notification: _PendingNotification) -> None:
+        """Queue a completion or failure without exceeding the delivery bound."""
 
-        def run_safely() -> None:
+        with self._condition:
+            if not self._accepting:
+                return
+            self._pending_progress.pop(notification.stage_key, None)
+            while self._pending_count_locked() >= self._max_pending and self._pending_progress:
+                self._pending_progress.popitem(last=False)
+            while self._pending_count_locked() >= self._max_pending and self._accepting:
+                self._condition.wait(timeout=0.1)
+            if not self._accepting:
+                return
+            self._terminal_notifications.append(notification)
+            self._condition.notify()
+
+    def _dispatch_loop(self) -> None:
+        """Deliver queued notifications on one bounded background worker."""
+
+        while True:
+            with self._condition:
+                notification = self._next_notification_locked()
+                while notification is None:
+                    if not self._accepting and self._pending_count_locked() == 0:
+                        return
+                    self._condition.wait(timeout=self._next_progress_wait_locked())
+                    notification = self._next_notification_locked()
             try:
-                fn()
+                if notification.kind == "progress":
+                    self._send_progress(
+                        notification.stage_key,
+                        notification.subject,
+                        notification.text,
+                    )
+                else:
+                    self._send_completion(
+                        notification.stage_key,
+                        notification.subject,
+                        notification.text,
+                    )
             except Exception:
                 LOGGER.exception("Notification delivery failed")
+            finally:
+                with self._condition:
+                    self._condition.notify_all()
 
-        threading.Thread(target=run_safely, daemon=True).start()
+    def _next_notification_locked(self) -> Optional[_PendingNotification]:
+        if self._terminal_notifications:
+            return self._terminal_notifications.popleft()
+        now = time.monotonic()
+        interval = max(
+            self._minimum_progress_interval_seconds,
+            float(self.config.progress_interval_seconds),
+        )
+        for stage_key, notification in list(self._pending_progress.items()):
+            last = self._last_progress_at.get(stage_key)
+            if last is None or now - last >= interval:
+                self._pending_progress.pop(stage_key)
+                self._last_progress_at[stage_key] = now
+                return notification
+        return None
+
+    def _next_progress_wait_locked(self) -> float:
+        if not self._pending_progress:
+            return 1.0
+        now = time.monotonic()
+        interval = max(
+            self._minimum_progress_interval_seconds,
+            float(self.config.progress_interval_seconds),
+        )
+        waits = [
+            max(0.01, interval - (now - self._last_progress_at.get(stage_key, 0.0)))
+            for stage_key in self._pending_progress
+            if stage_key in self._last_progress_at
+        ]
+        return min(waits, default=0.01)
+
+    def _pending_count_locked(self) -> int:
+        return len(self._pending_progress) + len(self._terminal_notifications)
+
+    def _reload_if_changed(self) -> None:
+        now = time.monotonic()
+        with self._condition:
+            if now - self._last_config_check_at < self._config_check_interval_seconds:
+                return
+            self._last_config_check_at = now
+            mtime_ns = self._read_config_mtime()
+            if mtime_ns == self._config_mtime_ns:
+                return
+        self.reload()
+
+    def _read_config_mtime(self) -> Optional[int]:
+        try:
+            return self.config_path.stat().st_mtime_ns
+        except OSError:
+            return None
 
     def _log_disabled(self) -> None:
         """Log a one-time hint when notifications are configured off."""
@@ -356,4 +500,3 @@ class NotificationManager:
         if len(text) <= MAX_TELEGRAM_TEXT:
             return text
         return text[: MAX_TELEGRAM_TEXT - 40] + "\n... truncated ..."
-
