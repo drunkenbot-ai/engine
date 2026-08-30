@@ -28,6 +28,7 @@ METRIC_FIELDS = (
     "sample_text",
 )
 FORCE_FLUSH_EVENT_TYPES = {
+    "lifecycle",
     "validation",
     "checkpoint",
     "warning",
@@ -267,6 +268,8 @@ def insert_metric(db_path: Path, run_id: str, event: dict[str, Any]) -> int:
 def latest_run(db_path: Path) -> Optional[sqlite3.Row]:
     """Return the latest sampled telemetry run metadata."""
 
+    if not _table_available(db_path, "live_metrics"):
+        return None
     with _read_connection(db_path) as connection:
         return connection.execute(
             """
@@ -283,6 +286,8 @@ def rows_until(db_path: Path, run_id: str, sample_index: int) -> list[sqlite3.Ro
     """Load metric rows up to a selected sample count."""
 
     if sample_index <= 0:
+        return []
+    if not _table_available(db_path, "live_metrics"):
         return []
     with _read_connection(db_path) as connection:
         return list(
@@ -301,6 +306,8 @@ def metric_rows_after(
 ) -> list[sqlite3.Row]:
     """Incrementally load metric samples after a previously observed row ID."""
 
+    if not _table_available(db_path, "live_metrics"):
+        return []
     with _read_connection(db_path) as connection:
         return list(
             connection.execute(
@@ -323,6 +330,8 @@ def event_rows_after(
 ) -> list[sqlite3.Row]:
     """Incrementally load durable events after a previously observed row ID."""
 
+    if not _table_available(db_path, "telemetry_events"):
+        return []
     with _read_connection(db_path) as connection:
         return list(
             connection.execute(
@@ -346,6 +355,17 @@ def _read_connection(db_path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA query_only=ON")
     connection.execute("PRAGMA busy_timeout=5000")
     return connection
+
+
+def _table_available(db_path: Path, table_name: str) -> bool:
+    if not Path(db_path).exists():
+        return False
+    with _read_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
 
 
 def _json_payload(event: dict[str, Any]) -> str:

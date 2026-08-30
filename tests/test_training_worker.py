@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -7,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+import engine.training_worker as worker_module
+import engine.training_worker_protocol as protocol_module
 from engine.config import ModelConfig, TrainingConfig
 from engine.contracts import TrainingJobSpec
 from engine.telemetry_store import event_rows_after, metric_rows_after
@@ -18,6 +22,8 @@ from engine.training_worker_protocol import (
     load_run_manifest,
     load_worker_request,
     manifest_is_stale,
+    process_identity,
+    process_identity_matches,
     worker_command,
     write_stop_request,
     write_worker_request,
@@ -26,7 +32,7 @@ from engine.training_worker_protocol import (
 
 def _job(tmp_path: Path) -> TrainingJobSpec:
     dataset_dir = tmp_path / "dataset"
-    dataset_dir.mkdir()
+    dataset_dir.mkdir(exist_ok=True)
     return TrainingJobSpec.local(
         dataset_dir,
         ModelConfig(
@@ -67,6 +73,9 @@ def test_request_round_trip_and_version_rejection(tmp_path: Path) -> None:
         "engine.training_worker",
         "--request",
     ]
+    second = create_worker_request(request.job, run_id="run-second")
+    assert second.manifest_path != request.manifest_path
+    assert second.control_path != request.control_path
 
     data = request.to_jsonable()
     data["version"] = 999
@@ -104,6 +113,7 @@ def test_worker_completes_with_heartbeat_and_persisted_telemetry(
                 "train_loss": 0.5,
             }
         )
+        progress({"event_type": "completion", "message": "trainer complete"})
         return _result(request)
 
     assert run_worker_request(request_path, run_job=fake_run) == 0
@@ -116,9 +126,9 @@ def test_worker_completes_with_heartbeat_and_persisted_telemetry(
     assert manifest["config_fingerprint"]
     assert "notifier" not in manifest
     assert len(metric_rows_after(request.telemetry_db_path, request.run_id)) == 1
-    assert event_rows_after(request.telemetry_db_path, request.run_id)[-1][
-        "event_type"
-    ] == "completion"
+    events = event_rows_after(request.telemetry_db_path, request.run_id)
+    assert events[-1]["event_type"] == "completion"
+    assert sum(row["event_type"] == "completion" for row in events) == 1
 
 
 def test_worker_honors_cooperative_stop(tmp_path: Path) -> None:
@@ -168,6 +178,54 @@ def test_worker_records_failure_status_and_details(tmp_path: Path) -> None:
     ] == "failure"
 
 
+def test_worker_setup_failure_still_writes_terminal_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    request = create_worker_request(_job(tmp_path), run_id="run-setup-failure")
+    request_path = write_worker_request(tmp_path / "request.json", request)
+
+    class BrokenTelemetryWriter:
+        def __init__(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("cannot open telemetry")
+
+    monkeypatch.setattr(worker_module, "TelemetryWriter", BrokenTelemetryWriter)
+
+    assert run_worker_request(request_path, run_job=lambda *_args: None) == 1
+    manifest = load_run_manifest(request.manifest_path)
+    assert manifest["status"] == "failed"
+    assert manifest["failure"]["type"] == "OperationalError"
+
+
+def test_concurrent_launch_is_rejected_without_overwriting_active_run(
+    tmp_path: Path,
+) -> None:
+    request = create_worker_request(_job(tmp_path), run_id="run-exclusive")
+    request_path = write_worker_request(tmp_path / "request.json", request)
+    started = threading.Event()
+    release = threading.Event()
+    first_result: list[int] = []
+
+    def slow_run(_job, _progress, _should_stop):
+        started.set()
+        release.wait(2.0)
+        return _result(request)
+
+    first = threading.Thread(
+        target=lambda: first_result.append(run_worker_request(request_path, slow_run))
+    )
+    first.start()
+    assert started.wait(1.0)
+
+    assert run_worker_request(request_path, slow_run) == 2
+    assert load_run_manifest(request.manifest_path)["status"] == "running"
+    release.set()
+    first.join(timeout=3.0)
+
+    assert first_result == [0]
+    assert load_run_manifest(request.manifest_path)["status"] == "completed"
+
+
 def test_stale_manifest_detection_uses_heartbeat_and_process_identity(
     tmp_path: Path,
 ) -> None:
@@ -189,3 +247,12 @@ def test_stale_manifest_detection_uses_heartbeat_and_process_identity(
         return _result(request)
 
     assert run_worker_request(request_path, run_job=inspect) == 0
+
+
+def test_stdlib_process_identity_fallback_is_verifiable(monkeypatch) -> None:
+    monkeypatch.setattr(protocol_module, "psutil", None)
+
+    identity = process_identity(os.getpid())
+
+    assert identity["kind"] != "unverifiable"
+    assert process_identity_matches(os.getpid(), identity)

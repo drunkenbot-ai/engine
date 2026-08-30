@@ -17,7 +17,11 @@ python -m engine.training_worker --request <absolute-request.json>
 `launch_worker_process()` redirects stdout/stderr to the model output directory
 and starts a new process session/process group. The UI may release the returned
 `Popen` object and close without stopping training. It must not supervise the
-worker with `QThread`.
+worker with `QThread`. A crash-recoverable `training_worker.lock` claim prevents
+two workers from writing the same output directory; worker exit code `2` means a
+launch was rejected because an active or already-finished run identity exists.
+Each run has its own manifest/control directory, so a prior stop sentinel cannot
+affect a later run.
 
 ### Request protocol (version 1)
 
@@ -28,8 +32,8 @@ worker with `QThread`.
   "run_id": "run_<durable-id>",
   "job": { "job_id": "...", "dataset": {}, "model": {}, "training": {}, "runtime": {}, "artifacts": {} },
   "paths": {
-    "manifest": "<output>/training_run_manifest.json",
-    "control": "<output>/training_control.json",
+    "manifest": "<output>/training_runs/<run-id>/manifest.json",
+    "control": "<output>/training_runs/<run-id>/control.json",
     "telemetry_db": "<output>/training_telemetry.sqlite"
   },
   "heartbeat_interval_seconds": 2.0,

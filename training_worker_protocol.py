@@ -29,8 +29,13 @@ PROCESS_IDENTITY_ERRORS = (OSError, ValueError, IndexError) + (
 REQUEST_SCHEMA = "drunkenbot.training-worker-request"
 MANIFEST_SCHEMA = "drunkenbot.training-run-manifest"
 CONTROL_SCHEMA = "drunkenbot.training-worker-control"
+CLAIM_SCHEMA = "drunkenbot.training-worker-claim"
 PROTOCOL_VERSION = 1
 TERMINAL_STATUSES = {"completed", "stopped", "failed"}
+
+
+class ActiveRunError(RuntimeError):
+    """Raised when an output directory already has a live or completed run claim."""
 
 
 def utc_now() -> str:
@@ -121,11 +126,12 @@ def create_worker_request(
     output_dir = job.artifacts.output_dir
     stable_run_id = run_id or f"run_{uuid4().hex}"
     telemetry_path = job.artifacts.telemetry_db or output_dir / "training_telemetry.sqlite"
+    run_state_dir = output_dir / "training_runs" / stable_run_id
     return StandaloneTrainingRequest(
         run_id=stable_run_id,
         job=job,
-        manifest_path=output_dir / "training_run_manifest.json",
-        control_path=output_dir / "training_control.json",
+        manifest_path=run_state_dir / "manifest.json",
+        control_path=run_state_dir / "control.json",
         telemetry_db_path=telemetry_path,
         notifier_config_path=notifier_config_path,
     )
@@ -168,6 +174,7 @@ def launch_worker_process(
 
     request_path = Path(request_path).resolve()
     request = load_worker_request(request_path)
+    assert_manifest_launchable(request)
     output_dir = request.job.artifacts.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = output_dir / "training_worker_stdout.log"
@@ -199,6 +206,117 @@ def launch_worker_process(
             stderr=stderr,
             **popen_options,
         )
+
+
+class RunClaim:
+    """Exclusive, crash-recoverable claim for one model output directory."""
+
+    def __init__(self, output_dir: Path, run_id: str) -> None:
+        self.path = Path(output_dir) / "training_worker.lock"
+        self.run_id = run_id
+        self.pid = os.getpid()
+        self.identity = process_identity(self.pid)
+        self._acquired = False
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": CLAIM_SCHEMA,
+            "version": PROTOCOL_VERSION,
+            "run_id": self.run_id,
+            "pid": self.pid,
+            "process_identity": self.identity,
+            "created_at": utc_now(),
+        }
+        for attempt in range(20):
+            try:
+                descriptor = os.open(
+                    self.path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                existing = self._read_existing_claim()
+                if existing is None:
+                    time.sleep(0.01 * (attempt + 1))
+                    continue
+                try:
+                    existing_pid = int(existing.get("pid", -1))
+                    existing_identity = dict(existing.get("process_identity") or {})
+                except (TypeError, ValueError):
+                    raise ActiveRunError(
+                        f"Invalid run claim blocks safe launch: {self.path}"
+                    )
+                if process_identity_matches(existing_pid, existing_identity):
+                    raise ActiveRunError(
+                        f"Output directory already has active run "
+                        f"{existing.get('run_id')} (PID {existing.get('pid')})"
+                    )
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(payload, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                self.path.unlink(missing_ok=True)
+                raise
+            self._acquired = True
+            return
+        raise ActiveRunError(f"Could not safely inspect existing run claim: {self.path}")
+
+    def release(self) -> None:
+        if not self._acquired:
+            return
+        existing = self._read_existing_claim()
+        if (
+            existing
+            and existing.get("run_id") == self.run_id
+            and existing.get("pid") == self.pid
+            and existing.get("process_identity") == self.identity
+        ):
+            self.path.unlink(missing_ok=True)
+        self._acquired = False
+
+    def _read_existing_claim(self) -> Optional[dict[str, Any]]:
+        try:
+            data = _load_json(self.path)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        if data.get("schema") != CLAIM_SCHEMA or data.get("version") != PROTOCOL_VERSION:
+            raise ActiveRunError(f"Unrecognized run claim blocks safe launch: {self.path}")
+        return data
+
+
+def assert_manifest_launchable(request: StandaloneTrainingRequest) -> None:
+    """Reject relaunch of the same durable run identity."""
+
+    if not request.manifest_path.exists():
+        return
+    try:
+        existing = load_run_manifest(request.manifest_path)
+    except (OSError, ValueError) as exc:
+        raise ActiveRunError(
+            f"Unreadable manifest blocks safe launch: {request.manifest_path}"
+        ) from exc
+    if existing.get("run_id") != request.run_id:
+        raise ActiveRunError(
+            f"Manifest path belongs to run {existing.get('run_id')}, not {request.run_id}"
+        )
+    if existing.get("status") in TERMINAL_STATUSES:
+        raise ActiveRunError(
+            f"Run {request.run_id} already finished with status {existing.get('status')}"
+        )
+    if manifest_process_is_current(existing):
+        raise ActiveRunError(f"Run {request.run_id} is already active")
+    raise ActiveRunError(
+        f"Run {request.run_id} has stale nonterminal metadata; create a new run ID"
+    )
 
 
 def write_stop_request(path: Path, run_id: str) -> Path:
@@ -312,10 +430,14 @@ def process_identity(pid: int) -> dict[str, str]:
     proc_stat = Path(f"/proc/{pid}/stat")
     boot_id_path = Path("/proc/sys/kernel/random/boot_id")
     if proc_stat.exists() and boot_id_path.exists():
-        fields = proc_stat.read_text(encoding="utf-8").split()
+        stat_text = proc_stat.read_text(encoding="utf-8")
+        fields_after_name = stat_text[stat_text.rfind(")") + 2 :].split()
         return {
             "kind": "linux-boot-start-ticks",
-            "value": f"{boot_id_path.read_text(encoding='utf-8').strip()}:{fields[21]}",
+            "value": (
+                f"{boot_id_path.read_text(encoding='utf-8').strip()}:"
+                f"{fields_after_name[19]}"
+            ),
         }
     return {"kind": "unverifiable", "value": ""}
 
@@ -411,15 +533,35 @@ def _validate_envelope(data: dict[str, Any], schema: str) -> None:
 
 
 def _windows_process_creation_filetime(pid: int) -> int:
+    from ctypes import wintypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [
+            ("low", wintypes.DWORD),
+            ("high", wintypes.DWORD),
+        ]
+
     process_query_limited_information = 0x1000
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
     if not handle:
         raise OSError(ctypes.get_last_error(), f"Cannot open process {pid}")
-    creation = ctypes.c_ulonglong()
-    exit_time = ctypes.c_ulonglong()
-    kernel_time = ctypes.c_ulonglong()
-    user_time = ctypes.c_ulonglong()
+    creation = FileTime()
+    exit_time = FileTime()
+    kernel_time = FileTime()
+    user_time = FileTime()
     try:
         success = kernel32.GetProcessTimes(
             handle,
@@ -430,6 +572,6 @@ def _windows_process_creation_filetime(pid: int) -> int:
         )
         if not success:
             raise OSError(ctypes.get_last_error(), f"Cannot inspect process {pid}")
-        return int(creation.value)
+        return int((creation.high << 32) | creation.low)
     finally:
         kernel32.CloseHandle(handle)
