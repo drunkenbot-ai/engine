@@ -211,6 +211,9 @@ class TrainingConfig:
         require_compatible_resume: Validate tokenizer/model compatibility before resuming.
         early_stopping: Stop training when validation loss stops improving.
         early_stopping_patience: Consecutive evaluations without improvement before stopping.
+        telemetry_interval_seconds: Minimum wall-clock interval between lightweight metric samples.
+        stability_metrics_interval_seconds: Minimum interval between expensive norm metrics.
+        preview_interval_seconds: Minimum interval between decoded sample previews.
     """
 
     output_dir: Path
@@ -247,6 +250,9 @@ class TrainingConfig:
     require_compatible_resume: bool = True
     early_stopping: bool = True
     early_stopping_patience: int = 3
+    telemetry_interval_seconds: float = 1.0
+    stability_metrics_interval_seconds: float = 15.0
+    preview_interval_seconds: float = 30.0
 
     def validate(self) -> None:
         """Validate optimizer and schedule settings.
@@ -282,6 +288,12 @@ class TrainingConfig:
             raise ValueError("polynomial_power must be greater than 0")
         if self.sample_stride <= 0:
             raise ValueError("sample_stride must be greater than 0")
+        if self.telemetry_interval_seconds < 0.0:
+            raise ValueError("telemetry_interval_seconds cannot be negative")
+        if self.stability_metrics_interval_seconds < 0.0:
+            raise ValueError("stability_metrics_interval_seconds cannot be negative")
+        if self.preview_interval_seconds < 0.0:
+            raise ValueError("preview_interval_seconds cannot be negative")
 
 
 def dataclass_to_jsonable(value: Any) -> dict[str, Any]:

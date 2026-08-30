@@ -3,6 +3,10 @@ from .training_runtime import *
 from .training_resume import _release_cuda_cache
 
 
+class TrainingStopRequested(RuntimeError):
+    """Signal cooperative cancellation from inside validation."""
+
+
 def evaluate(
     model: MicroGPT,
     loader: DataLoader,
@@ -37,7 +41,7 @@ def evaluate(
         for batch_index, (x, y) in enumerate(loader, start=1):
             if should_stop and should_stop():
                 model.train()
-                raise RuntimeError("Training stopped by user during validation.")
+                raise TrainingStopRequested("Training stopped by user during validation.")
             if batch_index > batch_limit:
                 break
             x = x.to(device)
@@ -64,4 +68,3 @@ def evaluate(
     model.train()
     _release_cuda_cache()
     return sum(losses) / max(len(losses), 1)
-
