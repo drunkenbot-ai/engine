@@ -21,7 +21,6 @@ from .dataset_preview_health import (
     _supported_source_paths_cancellable,
 )
 
-
 def scan_dataset_preview(
     config: DatasetConfig,
     sample_limit: int = 8,

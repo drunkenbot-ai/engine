@@ -1,10 +1,11 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 from .data_core import (Document, clean_text, read_supported_document,
-                        supported_source_paths, OperationCancelled)
+                        supported_source_paths, OperationCancelled, clean_code)
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def is_code_like_line(line: str) -> bool:

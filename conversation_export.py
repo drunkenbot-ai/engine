@@ -82,6 +82,24 @@ def _render_message_list(messages: list[Any]) -> str:
     return "\n".join(turns)
 
 
+def _hf_subprocess_environment(cache_dir: Path) -> dict[str, str]:
+    """Build a Hugging Face environment that stays inside the project cache.
+
+    Args:
+        cache_dir: Project-local Hugging Face cache directory.
+
+    Returns:
+        Environment variables for the extraction subprocess.
+    """
+
+    env = os.environ.copy()
+    env["HF_HOME"] = str(cache_dir / "hf_home")
+    env["HF_HUB_CACHE"] = str(cache_dir / "hub")
+    env["HF_DATASETS_CACHE"] = str(cache_dir / "datasets")
+    env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    return env
+
+
 def _extract_preset_to_jsonl(
     dataset_id: str,
     sample_limit: int,

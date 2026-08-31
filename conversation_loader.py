@@ -7,11 +7,34 @@ import subprocess
 import sys
 from threading import Thread
 from typing import Any, Callable, Optional
+from queue import Queue, Empty
+import json
 
 from .data import Document, clean_text
 from .conversation_presets import *
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _render_message_list(messages: list[Any]) -> str:
+    """Render common message-list schemas into role-prefixed turns."""
+
+    turns: list[str] = []
+    for index, message in enumerate(messages):
+        if isinstance(message, dict):
+            role = str(message.get("role") or message.get("from") or message.get("speaker") or "").strip()
+            content = str(message.get("content") or message.get("value") or message.get("text") or "").strip()
+        else:
+            role = "user" if index % 2 == 0 else "assistant"
+            content = str(message).strip()
+        if not content:
+            continue
+        label = "Assistant" if role.lower() in {"assistant", "gpt", "bot"} else "User"
+        if role.lower() in {"system"}:
+            label = "System"
+        turns.append(f"{label}: {content}")
+    return "\n".join(turns)
+
 
 def load_conversation_documents(
     dataset_ids: list[str],
