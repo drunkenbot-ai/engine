@@ -7,7 +7,15 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from .config import DatasetConfig, dataclass_to_jsonable
 from .conversation_datasets import CONVERSATION_DATASET_PRESETS, dataset_ids_for_stage, load_conversation_documents
-from .data import (Document, SUPPORTED_CODE_SUFFIXES, SUPPORTED_TEXT_SUFFIXES, document_from_dict, file_fingerprint, load_structured_json_documents, supported_source_paths)
+from .data import (
+    Document,
+    SUPPORTED_CODE_SUFFIXES,
+    SUPPORTED_TEXT_SUFFIXES,
+    document_from_dict,
+    file_fingerprint,
+    load_structured_json_documents_with_diagnostics,
+    supported_source_paths,
+)
 from .document_extraction import bad_extraction_reasons as _bad_extraction_reasons, extract_documents_worker
 from .manifest_store import ManifestStore
 from .dataset_corpus import _StreamingCorpusBuilder
@@ -138,9 +146,19 @@ def _load_documents_with_cache(
             pending_extraction.append(path)
             continue
 
+        cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(cached_payload, dict):
+            cached_items = list(cached_payload.get("documents") or [])
+            cached_record_errors = [
+                str(error)
+                for error in cached_payload.get("record_errors") or []
+            ]
+        else:
+            cached_items = list(cached_payload)
+            cached_record_errors = []
         cached_documents = [
             document_from_dict(item)
-            for item in json.loads(cache_path.read_text(encoding="utf-8"))
+            for item in cached_items
         ]
         cached_extraction_reasons = []
         if path.suffix.lower() == ".pdf":
@@ -173,13 +191,19 @@ def _load_documents_with_cache(
         _submit_cached(cached_documents)
         del cached_documents
         cached_count += 1
+        if cached_record_errors:
+            failed_count += 1
+            for error in cached_record_errors:
+                _emit(progress, f"Invalid record: {error}")
         manifest.upsert(
             manifest_key,
             {
                 "path": str(path), "sha256": digest, "size": stat.st_size,
                 "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                 "cache_file": str(cache_path.relative_to(config.output_dir)),
-                "status": "cached",
+                "status": "cached_partial" if cached_record_errors else "cached",
+                "record_error_count": len(cached_record_errors),
+                "record_errors": cached_record_errors,
             },
             commit=False,
         )
@@ -290,7 +314,35 @@ def _load_documents_with_cache(
                     )
                     continue
 
+                record_errors = [
+                    str(error)
+                    for error in result.get("record_errors") or []
+                ]
+                for error in record_errors:
+                    _emit(progress, f"Invalid record: {error}", percent)
+
                 if not result["documents"]:
+                    if record_errors:
+                        failed_count += 1
+                        _emit(
+                            progress,
+                            f"Failed {path.name}: no valid records; "
+                            f"{len(record_errors)} invalid record(s).",
+                            percent,
+                        )
+                        manifest.upsert(
+                            manifest_key,
+                            {
+                                "path": str(path), "sha256": digest,
+                                "size": stat.st_size,
+                                "mtime_ns": stat.st_mtime_ns, "cache_key": key,
+                                "status": "failed_invalid_records",
+                                "record_error_count": len(record_errors),
+                                "record_errors": record_errors,
+                            },
+                            commit=False,
+                        )
+                        continue
                     skipped_count += 1
                     _emit(progress, f"Skipped {path.name}: no readable text found.", percent)
                     manifest.upsert(
@@ -304,18 +356,39 @@ def _load_documents_with_cache(
                     )
                     continue
 
-                cache_path.write_text(json.dumps(result["documents"], ensure_ascii=False), encoding="utf-8")
+                cache_path.write_text(
+                    json.dumps(
+                        {
+                            "documents": result["documents"],
+                            "record_errors": record_errors,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
                 for item in result["documents"]:
                     corpus_builder.submit(document_from_dict(item))
                 processed_count += 1
-                _emit(progress, f"Processed {path.name}: {len(result['documents'])} sample(s).", percent)
+                if record_errors:
+                    failed_count += 1
+                    _emit(
+                        progress,
+                        f"Partially processed {path.name}: "
+                        f"{len(result['documents'])} valid sample(s), "
+                        f"{len(record_errors)} invalid record(s).",
+                        percent,
+                    )
+                else:
+                    _emit(progress, f"Processed {path.name}: {len(result['documents'])} sample(s).", percent)
                 manifest.upsert(
                     manifest_key,
                     {
                         "path": str(path), "sha256": digest, "size": stat.st_size,
                         "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                         "cache_file": str(cache_path.relative_to(config.output_dir)),
-                        "status": "processed",
+                        "status": "partial" if record_errors else "processed",
+                        "record_error_count": len(record_errors),
+                        "record_errors": record_errors,
                     },
                     commit=False,
                 )
@@ -326,14 +399,30 @@ def _load_documents_with_cache(
         local_path = Path(local_path)
         _emit(progress, f"Loading {label} JSON/JSONL dataset: {local_path}",
               42)
-        local_documents = load_structured_json_documents(local_path, kind=kind,
-                                                         lowercase=config.lowercase,
-                                                         on_invalid=lambda message: _emit(progress, message, 42))
-        for document in local_documents:
+        local_result = load_structured_json_documents_with_diagnostics(
+            local_path,
+            kind=kind,
+            lowercase=config.lowercase,
+            on_invalid=lambda message: _emit(progress, f"Invalid record: {message}", 42),
+        )
+        for document in local_result.documents:
             corpus_builder.submit(document)
-        local_document_count = len(local_documents)
-        del local_documents
-        processed_count += 1
+        local_document_count = len(local_result.documents)
+        invalid_files = {issue.path.resolve() for issue in local_result.issues}
+        document_files = {
+            Path(str(document.path).rsplit("#", 1)[0]).resolve()
+            for document in local_result.documents
+        }
+        processed_count += len(document_files)
+        failed_count += len(invalid_files)
+        issue_messages = [issue.message() for issue in local_result.issues]
+        status = (
+            "partial"
+            if local_document_count and issue_messages
+            else "failed_invalid_records"
+            if issue_messages
+            else "processed"
+        )
         manifest_key = f"local-{kind}://{local_path.resolve()}"
         manifest.upsert(
             manifest_key,
@@ -342,13 +431,18 @@ def _load_documents_with_cache(
                 "kind": kind,
                 "sample_count": local_document_count,
                 "cache_key": key,
-                "status": "processed",
+                "status": status,
+                "record_error_count": len(issue_messages),
+                "record_errors": issue_messages,
             },
             commit=False,
         )
-        _emit(progress,
-              f"Loaded {local_document_count:,} {kind} sample(s) from {local_path.name}.",
-              43)
+        _emit(
+            progress,
+            f"Loaded {local_document_count:,} valid {kind} sample(s) from "
+            f"{local_path.name}; {len(issue_messages):,} invalid record(s).",
+            43,
+        )
 
     if config.conversation_datasets:
         allowed_dataset_ids = set(dataset_ids_for_stage(config.dataset_stage))
@@ -431,4 +525,3 @@ def _load_documents_with_cache(
         skipped_count,
         failed_count,
     )
-

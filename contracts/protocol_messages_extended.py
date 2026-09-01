@@ -1,11 +1,10 @@
-﻿from __future__ import annotations
+﻿# ruff: noqa: F403, F405
+from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 from typing import Any, Optional
-from uuid import uuid4
 
-from engine.contracts.jobs import BackendKind, TrainingJobSpec, TrainingMetrics, TrainingResultSpec, utc_now_iso
+from engine.contracts.jobs import TrainingResultSpec
 
 
 from .protocol_types import *
@@ -235,4 +234,3 @@ def _result_from_jsonable(data: dict[str, Any]) -> TrainingResultSpec:
         error=data.get("error"),
         artifact_bundle_url=data.get("artifact_bundle_url"),
     )
-

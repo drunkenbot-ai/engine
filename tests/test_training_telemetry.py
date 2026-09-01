@@ -92,8 +92,69 @@ def test_unsampled_optimizer_steps_skip_weight_norm_and_preview(
     metric_events = [event for event in events if event.get("event_type") == "metrics"]
     assert len(metric_events) == 1
     assert metric_events[0]["step"] < 5
+    assert metric_events[0]["step_seconds"] >= metric_events[0]["average_step_seconds"]
     assert calls == {"weight_norm": 1, "preview": 1}
     assert result.summary_path.exists()
+
+
+def test_training_without_progress_skips_telemetry_sampling(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model_config = ModelConfig(
+        vocab_size=16,
+        context_length=8,
+        embedding_size=8,
+        head_count=2,
+        layer_count=1,
+        dropout=0.0,
+    )
+    training_config = TrainingConfig(
+        output_dir=tmp_path,
+        epochs=1,
+        batch_size=1,
+        sample_stride=8,
+        warmup_steps=0,
+        eval_interval=0,
+        save_interval=0,
+        use_amp=False,
+        precision="fp32",
+        device="cpu",
+        resume=False,
+        early_stopping=False,
+    )
+    calls = {"weight_norm": 0, "cpu": 0, "ram": 0}
+
+    def counted(name, value):
+        def sample(*_args):
+            calls[name] += 1
+            return value
+
+        return sample
+
+    monkeypatch.setattr(
+        "engine.training_impl._model_weight_norm",
+        counted("weight_norm", 1.0),
+    )
+    monkeypatch.setattr(
+        "engine.training_impl.system_cpu_percent",
+        counted("cpu", 1.0),
+    )
+    monkeypatch.setattr(
+        "engine.training_impl.system_ram_percent",
+        counted("ram", 1.0),
+    )
+    train_model(
+        model_config,
+        training_config,
+        [index % 16 for index in range(32)],
+        [],
+        pad_token_id=-1,
+        progress=None,
+        decode_preview=lambda _tokens: "unused",
+    )
+
+    assert calls == {"weight_norm": 0, "cpu": 0, "ram": 0}
 
 
 def test_stop_requested_during_validation_exports_stopped_checkpoint(

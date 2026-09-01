@@ -31,6 +31,8 @@ WorkerJob = Callable[
     TrainingResult,
 ]
 
+__all__ = ["WorkerJob", "main", "run_worker_request"]
+
 
 class _Heartbeat:
     def __init__(self, manifest: AtomicRunManifest, interval_seconds: float) -> None:

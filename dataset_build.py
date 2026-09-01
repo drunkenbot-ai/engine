@@ -9,7 +9,6 @@ import numpy as np
 from .config import DatasetConfig, dataclass_to_jsonable
 from .data import file_sha256
 from .dataset_corpus import _StreamingCorpusBuilder
-from .dataset_helpers import _emit
 from .dataset_loader import _load_documents_with_cache
 from .dataset_mixture import MAX_REPETITIVE_UNIT_RATIO
 from .dataset_quality import _dataset_quality_report

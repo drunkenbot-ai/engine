@@ -6,7 +6,7 @@ The core API of drunkenBot IDE.
 
 Local training can run outside the desktop process, with no Qt dependency. Create
 a `TrainingJobSpec`, wrap it with
-`training_worker_protocol.create_worker_request()`, atomically persist it with
+`engine.training_worker_protocol.create_worker_request()`, atomically persist it with
 `write_worker_request()`, and launch it with
 `launch_worker_process(request_path)`. The equivalent stable command is:
 
@@ -115,8 +115,9 @@ process.
 Lifecycle, warning, validation, checkpoint, stop, failure, and completion events
 remain immediate. Unsampled optimizer steps perform no parameter traversal,
 preview copy/decode, system sampling, scalar loss conversion, or progress
-callback. Throughput uses all steps and actual wall-clock time since the previous
-sample.
+callback. Throughput uses the exact batches and tokens completed during the
+wall-clock sample window; `average_step_seconds` normalizes that window by the
+number of completed optimizer steps.
 
 The worker owns one `TelemetryWriter` connection in WAL mode, batches metric
 samples and ordinary lifecycle records, and force-flushes validation, checkpoint,
