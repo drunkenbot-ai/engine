@@ -6,12 +6,14 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Callable
+from typing import Any, Callable, Iterator, Optional
 
 import PyPDF2
 
-LOGGER = logging.getLogger(__name__)
 from .tool_call_data import format_tool_call_record
+
+LOGGER = logging.getLogger(__name__)
+
 
 class OperationCancelled(RuntimeError):
     """Raised when a long-running operation is cancelled by the user."""
@@ -67,6 +69,32 @@ class Document:
     text: str
     kind: str = "prose"
     language: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class JsonRecordIssue:
+    """One malformed or schema-invalid JSON/JSONL record."""
+
+    path: Path
+    record_number: int
+    reason: str
+
+    def message(self) -> str:
+        location = (
+            f"line {self.record_number}"
+            if self.path.suffix.lower() == ".jsonl"
+            else f"record {self.record_number}"
+        )
+        return f"{self.path.name}, {location}: {self.reason}"
+
+
+@dataclass
+class StructuredDocumentLoad:
+    """Structured documents plus per-record diagnostics and source files."""
+
+    documents: list[Document]
+    issues: list[JsonRecordIssue]
+    source_files: list[Path]
 
 
 def document_to_dict(document: Document) -> dict[str, Any]:
@@ -258,30 +286,54 @@ def read_jsonl(path: Path) -> str:
     return "\n".join(chunks)
 
 
-def load_jsonl_documents(path: Path, lowercase: bool = False) -> list[Document]:
+def load_jsonl_documents(
+    path: Path,
+    lowercase: bool = False,
+    on_invalid: Optional[Callable[[str], None]] = None,
+) -> list[Document]:
     """Load each JSONL record as an independent training document."""
     documents: list[Document] = []
+    record_seen = False
     for index, record, error in _iter_json_records_with_errors(path):
+        record_seen = True
         if error:
-            LOGGER.warning("%s:%s: %s", path, index, error)
+            _report_json_issue(
+                JsonRecordIssue(path, index, error),
+                issues=None,
+                on_invalid=on_invalid,
+            )
             continue
-        kind = "tool_call" if isinstance(record, dict) and any(
-            key in record for key in ("tool_calls", "tool_results", "tools")
-        ) else "conversation" if isinstance(record, (dict, list)) and (
-            isinstance(record, list) or any(
-                key in record for key in ("messages", "conversations", "dialogue", "turns")
+        kind = _structured_record_kind(record)
+        validation_error = _structured_record_error(record, kind)
+        if validation_error:
+            _report_json_issue(
+                JsonRecordIssue(path, index, validation_error),
+                issues=None,
+                on_invalid=on_invalid,
             )
-        ) else "instruction"
+            continue
         text = clean_text(_extract_structured_text(record, kind), lowercase=lowercase)
-        if text:
-            documents.append(
-                Document(
-                    path=Path(f"{path}#{index}"),
-                    text=text,
-                    kind=kind,
-                    language="local_json",
-                )
+        if not text:
+            _report_json_issue(
+                JsonRecordIssue(path, index, "record contains no extractable text"),
+                issues=None,
+                on_invalid=on_invalid,
             )
+            continue
+        documents.append(
+            Document(
+                path=Path(f"{path}#{index}"),
+                text=text,
+                kind=kind,
+                language="local_json",
+            )
+        )
+    if not record_seen:
+        _report_json_issue(
+            JsonRecordIssue(path, 0, "file contains no records"),
+            issues=None,
+            on_invalid=on_invalid,
+        )
     return documents
 
 
@@ -448,8 +500,12 @@ def _extract_structured_text(record: Any, kind: str) -> str:
     return ""
 
 
-def load_structured_json_documents(path: Path, kind: str, lowercase: bool = False,
-                                   on_invalid: Callable[[str], None] | None = None) -> list[Document]:
+def load_structured_json_documents(
+    path: Path,
+    kind: str,
+    lowercase: bool = False,
+    on_invalid: Optional[Callable[[str], None]] = None,
+) -> list[Document]:
     """Load conversation or instruction samples from JSON/JSONL files.
 
     Args:
@@ -465,6 +521,22 @@ def load_structured_json_documents(path: Path, kind: str, lowercase: bool = Fals
         ValueError: If the file type is unsupported.
     """
 
+    return load_structured_json_documents_with_diagnostics(
+        path,
+        kind,
+        lowercase=lowercase,
+        on_invalid=on_invalid,
+    ).documents
+
+
+def load_structured_json_documents_with_diagnostics(
+    path: Path,
+    kind: str,
+    lowercase: bool = False,
+    on_invalid: Optional[Callable[[str], None]] = None,
+) -> StructuredDocumentLoad:
+    """Load structured records while retaining source-level diagnostics."""
+
     if kind not in {"conversation", "instruction", "tool_call"}:
         raise ValueError(f"Unsupported structured dataset kind: {kind}")
     path = Path(path)
@@ -475,24 +547,40 @@ def load_structured_json_documents(path: Path, kind: str, lowercase: bool = Fals
         raise ValueError(f"No .json or .jsonl files found in {path}")
 
     documents: list[Document] = []
+    issues: list[JsonRecordIssue] = []
     for file_path in files:
         if file_path.suffix.lower() not in {".json", ".jsonl"}:
             raise ValueError(f"Unsupported structured dataset file: {file_path}")
+        record_seen = False
         for index, record, error in _iter_json_records_with_errors(file_path):
+            record_seen = True
             if error:
-                LOGGER.warning("%s:%s: %s", file_path, index, error)
-                if on_invalid:
-                    on_invalid(f"Skipped {file_path.name}, line/record {index}: {error}.")
+                _report_json_issue(
+                    JsonRecordIssue(file_path, index, error),
+                    issues,
+                    on_invalid,
+                )
                 continue
             validation_error = _structured_record_error(record, kind)
             if validation_error:
-                LOGGER.warning("%s:%s: %s", file_path, index, validation_error)
-                if on_invalid:
-                    on_invalid(f"Skipped {file_path.name}, line/record {index}: {validation_error}.")
+                _report_json_issue(
+                    JsonRecordIssue(file_path, index, validation_error),
+                    issues,
+                    on_invalid,
+                )
                 continue
             text = _extract_structured_text(record, kind)
             text = clean_code(text, lowercase=lowercase)
             if not text:
+                _report_json_issue(
+                    JsonRecordIssue(
+                        file_path,
+                        index,
+                        "record contains no extractable text",
+                    ),
+                    issues,
+                    on_invalid,
+                )
                 continue
             documents.append(
                 Document(
@@ -502,7 +590,47 @@ def load_structured_json_documents(path: Path, kind: str, lowercase: bool = Fals
                     language="local_json",
                 )
             )
-    return documents
+        if not record_seen:
+            _report_json_issue(
+                JsonRecordIssue(file_path, 0, "file contains no records"),
+                issues,
+                on_invalid,
+            )
+    return StructuredDocumentLoad(documents, issues, files)
+
+
+def _report_json_issue(
+    issue: JsonRecordIssue,
+    issues: Optional[list[JsonRecordIssue]],
+    on_invalid: Optional[Callable[[str], None]],
+) -> None:
+    LOGGER.warning("%s", issue.message())
+    if issues is not None:
+        issues.append(issue)
+    if on_invalid is not None:
+        on_invalid(issue.message())
+
+
+def _structured_record_kind(record: Any) -> str:
+    if isinstance(record, dict) and any(
+        key in record for key in ("tool_calls", "tool_results", "tools")
+    ):
+        return "tool_call"
+    if isinstance(record, list) or (
+        isinstance(record, dict)
+        and any(
+            key in record
+            for key in (
+                "messages",
+                "conversations",
+                "dialogue",
+                "utterances",
+                "turns",
+            )
+        )
+    ):
+        return "conversation"
+    return "instruction"
 
 
 def _structured_record_error(record: Any, kind: str) -> str | None:
@@ -543,7 +671,9 @@ def _structured_record_error(record: Any, kind: str) -> str | None:
     return None
 
 
-def _iter_json_records_with_errors(path: Path):
+def _iter_json_records_with_errors(
+    path: Path,
+) -> Iterator[tuple[int, Any, Optional[str]]]:
     """Yield (record number, record, error) while isolating malformed JSON rows."""
     if path.suffix.lower() == ".jsonl":
         with path.open("r", encoding="utf-8") as file:

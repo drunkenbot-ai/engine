@@ -17,7 +17,6 @@ from .export import export_hf_microgpt_package
 from .dataset_build import build_dataset
 from .training_orchestrator import train_from_dataset
 from .tokenizer import load_tokenizer
-from .worker import WorkerClientConfig, run_worker_client
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -223,6 +222,8 @@ def worker_client(args: argparse.Namespace) -> None:
         args: Parsed command-line arguments for the worker client command.
     """
 
+    from .worker import WorkerClientConfig, run_worker_client
+
     labels = [item.strip() for item in args.labels.split(",") if item.strip()]
     config = WorkerClientConfig(
         coordinator_url=args.coordinator_url,
@@ -407,4 +408,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

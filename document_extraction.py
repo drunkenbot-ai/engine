@@ -103,11 +103,17 @@ def extract_documents_worker(
 
     try:
         if path.suffix.lower() == ".jsonl":
-            source_documents = load_jsonl_documents(path, lowercase=lowercase)
+            record_errors: list[str] = []
+            source_documents = load_jsonl_documents(
+                path,
+                lowercase=lowercase,
+                on_invalid=record_errors.append,
+            )
             return {
                 "path": str(path),
                 "documents": [document_to_dict(doc) for doc in source_documents],
                 "error": None,
+                "record_errors": record_errors,
                 "bad_extraction_reasons": [],
             }
         source_doc = read_supported_document(
@@ -117,10 +123,22 @@ def extract_documents_worker(
             preserve_indentation=preserve_indentation,
         )
     except Exception as exc:  # noqa: BLE001 - reported back to the main process
-        return {"path": str(path), "documents": [], "error": str(exc), "bad_extraction_reasons": []}
+        return {
+            "path": str(path),
+            "documents": [],
+            "error": str(exc),
+            "record_errors": [],
+            "bad_extraction_reasons": [],
+        }
 
     if source_doc is None:
-        return {"path": str(path), "documents": [], "error": None, "bad_extraction_reasons": []}
+        return {
+            "path": str(path),
+            "documents": [],
+            "error": None,
+            "record_errors": [],
+            "bad_extraction_reasons": [],
+        }
 
     reasons = bad_extraction_reasons(
         path,
@@ -134,7 +152,13 @@ def extract_documents_worker(
         path.stat().st_size,
     )
     if path.suffix.lower() == ".pdf" and reasons:
-        return {"path": str(path), "documents": [], "error": None, "bad_extraction_reasons": reasons}
+        return {
+            "path": str(path),
+            "documents": [],
+            "error": None,
+            "record_errors": [],
+            "bad_extraction_reasons": reasons,
+        }
 
     source_documents: list[Document] = [source_doc]
     if code_training_mode:
@@ -149,6 +173,7 @@ def extract_documents_worker(
         "path": str(path),
         "documents": [document_to_dict(doc) for doc in source_documents],
         "error": None,
+        "record_errors": [],
         "bad_extraction_reasons": [],
     }
 

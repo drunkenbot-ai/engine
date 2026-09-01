@@ -1,11 +1,13 @@
 ﻿from __future__ import annotations
 
+import argparse
 import json
+import os
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
-from .conversation_presets import *
-from .conversation_loader import *
+from .conversation_presets import CONVERSATION_DATASET_PRESETS
+from .data import clean_text
 
 def _conversation_text_from_row(row: dict[str, Any]) -> tuple[str, str]:
     """Extract tagged conversation/instruction text from a dataset row.
@@ -230,4 +232,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

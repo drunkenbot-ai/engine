@@ -25,6 +25,26 @@ PROCESS_IDENTITY_ERRORS = (OSError, ValueError, IndexError) + (
     (psutil.Error,) if psutil is not None else ()
 )
 
+__all__ = [
+    "ActiveRunError",
+    "AtomicRunManifest",
+    "StandaloneTrainingRequest",
+    "assert_manifest_launchable",
+    "create_worker_request",
+    "launch_worker_process",
+    "load_run_manifest",
+    "load_stop_request",
+    "load_worker_request",
+    "manifest_is_stale",
+    "manifest_process_is_current",
+    "process_identity",
+    "process_identity_matches",
+    "utc_now",
+    "worker_command",
+    "write_stop_request",
+    "write_worker_request",
+]
+
 
 REQUEST_SCHEMA = "drunkenbot.training-worker-request"
 MANIFEST_SCHEMA = "drunkenbot.training-run-manifest"

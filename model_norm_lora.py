@@ -224,6 +224,38 @@ def lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
+def merged_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Return plain-model weights with LoRA updates merged without mutating the model."""
+
+    replacements: dict[str, tuple[str, torch.Tensor]] = {}
+    adapter_keys: set[str] = set()
+    for module_name, module in model.named_modules():
+        if not isinstance(module, LoRALinear):
+            continue
+        prefix = f"{module_name}."
+        replacements[f"{prefix}base.weight"] = (
+            f"{prefix}weight",
+            module.base.weight.detach()
+            + (module.lora_b.detach() @ module.lora_a.detach()) * module.scaling,
+        )
+        if module.base.bias is not None:
+            replacements[f"{prefix}base.bias"] = (
+                f"{prefix}bias",
+                module.base.bias.detach(),
+            )
+        adapter_keys.update({f"{prefix}lora_a", f"{prefix}lora_b"})
+
+    merged: dict[str, torch.Tensor] = {}
+    for name, tensor in model.state_dict().items():
+        replacement = replacements.get(name)
+        if replacement is not None:
+            merged_name, merged_tensor = replacement
+            merged[merged_name] = merged_tensor.cpu()
+        elif name not in adapter_keys:
+            merged[name] = tensor.detach().cpu()
+    return merged
+
+
 def load_lora_state_dict(model: nn.Module, state: dict[str, torch.Tensor]) -> None:
     """Load LoRA adapter tensors into a model.
 
@@ -259,6 +291,12 @@ def merge_lora_adapters(model: nn.Module) -> int:
     return merged
 
 
+def lora_adapter_count(model: nn.Module) -> int:
+    """Count LoRA-wrapped linear modules."""
+
+    return sum(isinstance(module, LoRALinear) for module in model.modules())
+
+
 def lora_parameter_count(model: nn.Module) -> int:
     """Count trainable LoRA parameters.
 
@@ -270,6 +308,4 @@ def lora_parameter_count(model: nn.Module) -> int:
     """
 
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-
-
 

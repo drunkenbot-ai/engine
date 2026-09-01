@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
 
-from engine.contracts.jobs import BackendKind, TrainingJobSpec, TrainingMetrics, TrainingResultSpec, utc_now_iso
+from engine.contracts.jobs import utc_now_iso
 
 
 class ProtocolMessageKind(str, Enum):
