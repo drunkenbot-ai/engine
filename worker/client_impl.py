@@ -1,24 +1,20 @@
 ﻿from __future__ import annotations
 
-import json
+import hashlib
 import os
 import platform
 import shutil
 import socket
 import time
 import zipfile
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urljoin
-from urllib.request import Request, urlopen
 
 import torch
 
 from engine.coordinator.artifacts import create_result_artifact_bundle
 from engine.contracts import (
     ArtifactSpec,
-    BackendKind,
     ClaimJobRequest,
     ClaimJobResponse,
     CompleteJobRequest,
@@ -34,8 +30,12 @@ from engine.contracts import (
     WorkerCapabilities,
 )
 from engine.contracts.jobs import JobStatus, TrainingJobSpec
+from engine.gpu_discovery import discover_gpus
 from engine.training_orchestrator import train_from_dataset
-
+try:
+    import psutil
+except ImportError:
+    psutil = None
 from .client_core import CoordinatorHttpClient, WorkerClientConfig
 class RemoteWorkerClient:
     """Remote worker client that talks to the coordinator API."""
@@ -48,7 +48,7 @@ class RemoteWorkerClient:
         """
 
         self.config = config
-        self.http = CoordinatorHttpClient(config.coordinator_url)
+        self.http = CoordinatorHttpClient(config.coordinator_url, config.api_key)
         self.stop_requested = False
         self.pause_requested = False
         self.active_job_id: Optional[str] = None
@@ -62,7 +62,7 @@ class RemoteWorkerClient:
 
         request = RegisterWorkerRequest(
             worker_id=self.config.worker_id,
-            backend=BackendKind.REMOTE_CLIENT,
+            backend=self.config.backend,
             device=self.config.device,
             capabilities=detect_worker_capabilities(),
             labels=self.config.labels,
@@ -86,7 +86,7 @@ class RemoteWorkerClient:
         request = HeartbeatRequest(
             worker_id=self.config.worker_id,
             availability=availability,
-            backend=BackendKind.REMOTE_CLIENT,
+            backend=self.config.backend,
             active_job_id=self.active_job_id,
             device=self.config.device,
             metrics=metrics or {},
@@ -105,7 +105,7 @@ class RemoteWorkerClient:
 
         request = ClaimJobRequest(
             worker_id=self.config.worker_id,
-            backend=BackendKind.REMOTE_CLIENT,
+            backend=self.config.backend,
             capabilities=detect_worker_capabilities(),
         )
         response = ClaimJobResponse.from_jsonable(self.http.post("/claim-job", request.to_jsonable()))
@@ -118,7 +118,7 @@ class RemoteWorkerClient:
 
         self.register()
         while True:
-            self.heartbeat(WorkerAvailability.AVAILABLE)
+            self.heartbeat(WorkerAvailability.AVAILABLE, self._telemetry())
             if not self.config.execute_jobs and not self.config.claim_once:
                 time.sleep(self.config.heartbeat_interval_seconds)
                 continue
@@ -204,13 +204,32 @@ class RemoteWorkerClient:
             Job rewritten to worker-local paths.
         """
 
+        manifest_url = str(job.metadata.get("project_manifest_url") or "")
+        if manifest_url:
+            return self._sync_project_delta(job, manifest_url)
         bundle_url = str(job.metadata.get("artifact_bundle_url") or "")
         if not bundle_url:
             return job
         workspace = self._job_workspace(job.job_id)
         bundle_path = workspace / "input_bundle.zip"
         extract_dir = workspace / "input"
-        self.http.download(bundle_url, bundle_path)
+        # A manifest makes cache reuse safe and turns an interrupted transfer
+        # into a Range-resumed download. Older coordinators may not expose it.
+        manifest = None
+        try:
+            manifest = self.http.get(f"{bundle_url.rstrip('/')}/manifest")
+        except Exception:
+            pass
+        if manifest and bundle_path.is_file() and _file_sha256(bundle_path) == manifest.get("sha256"):
+            pass
+        else:
+            self.http.download(bundle_url, bundle_path)
+            if manifest and _file_sha256(bundle_path) != manifest.get("sha256"):
+                # Do not ever train on a corrupt or mixed-version partial cache.
+                bundle_path.unlink(missing_ok=True)
+                self.http.download(bundle_url, bundle_path)
+                if _file_sha256(bundle_path) != manifest.get("sha256"):
+                    raise ValueError(f"Artifact integrity check failed: {bundle_url}")
         if extract_dir.exists():
             shutil.rmtree(extract_dir)
         extract_dir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +253,43 @@ class RemoteWorkerClient:
             if base_path.is_file():
                 job.training.fine_tune_from_checkpoint = base_path
                 job.model.base_checkpoint = base_path
+        return job
+
+    def _sync_project_delta(self, job: TrainingJobSpec, manifest_url: str) -> TrainingJobSpec:
+        """Synchronize only changed project files, with per-file resume/hash checks."""
+        manifest = self.http.get(manifest_url)
+        base_url = str(job.metadata["project_base_url"]).rstrip("/")
+        workspace = self._job_workspace(job.job_id)
+        input_dir = workspace / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        expected = set()
+        for entry in manifest.get("files", []):
+            relative = Path(str(entry["path"]))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"Unsafe project manifest path: {relative}")
+            expected.add(relative.as_posix())
+            local = input_dir / relative
+            digest = str(entry.get("sha256") or "")
+            if not local.is_file() or _file_sha256(local) != digest:
+                self.http.download(f"{base_url}/{relative.as_posix()}", local)
+                if _file_sha256(local) != digest:
+                    local.unlink(missing_ok=True)
+                    self.http.download(f"{base_url}/{relative.as_posix()}", local)
+                    if _file_sha256(local) != digest:
+                        raise ValueError(
+                            f"Project file integrity check failed: {relative}"
+                        )
+        for local in input_dir.rglob("*"):
+            if local.is_file() and local.relative_to(input_dir).as_posix() not in expected:
+                local.unlink()
+        dataset_dir = input_dir / "dataset"
+        if not dataset_dir.exists():
+            raise FileNotFoundError("Project manifest does not contain dataset/")
+        output_dir = workspace / "model"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        job.dataset = DatasetSpec.from_dataset_dir(dataset_dir)
+        job.training.output_dir = output_dir
+        job.artifacts = ArtifactSpec.from_output_dir(output_dir)
         return job
 
     def upload_result_artifacts(self, job: TrainingJobSpec) -> Optional[str]:
@@ -269,6 +325,20 @@ class RemoteWorkerClient:
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 
+    def _telemetry(self) -> dict[str, Any]:
+        """Collect a compact, cross-platform heartbeat telemetry snapshot."""
+        snapshot: dict[str, Any] = {"gpus": [gpu.to_jsonable() for gpu in discover_gpus()]}
+        if psutil is not None:
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage(
+                str(Path(self.config.workspace_dir).anchor or Path.cwd())
+            )
+            network = psutil.net_io_counters()
+            snapshot.update({"cpu_percent": psutil.cpu_percent(), "ram_percent": memory.percent,
+                "free_ram_gb": memory.available / (1024**3), "free_disk_gb": disk.free / (1024**3),
+                "network_bytes_sent": network.bytes_sent, "network_bytes_recv": network.bytes_recv})
+        return snapshot
+
     def fail_job(self, job_id: str, error: str, retryable: bool) -> None:
         """Report job failure to the coordinator.
 
@@ -288,15 +358,9 @@ def detect_worker_capabilities() -> WorkerCapabilities:
         Worker capabilities.
     """
 
-    gpu_names: list[str] = []
-    total_vram_gb: Optional[float] = None
-    if torch.cuda.is_available():
-        total_vram_bytes = 0
-        for index in range(torch.cuda.device_count()):
-            properties = torch.cuda.get_device_properties(index)
-            gpu_names.append(properties.name)
-            total_vram_bytes += int(properties.total_memory)
-        total_vram_gb = total_vram_bytes / (1024**3)
+    gpu_records = [gpu.to_jsonable() for gpu in discover_gpus()]
+    gpu_names: list[str] = [str(gpu["name"]) for gpu in gpu_records]
+    total_vram_gb: Optional[float] = sum(float(gpu.get("vram_total_gb") or 0) for gpu in gpu_records) or None
     system_ram_gb = None
     if psutil is not None:
         system_ram_gb = psutil.virtual_memory().total / (1024**3)
@@ -310,6 +374,7 @@ def detect_worker_capabilities() -> WorkerCapabilities:
         supports_cuda=torch.cuda.is_available(),
         supports_bf16=bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
         supports_fp16=torch.cuda.is_available(),
+        extra={"gpus": gpu_records},
     )
 
 
@@ -402,3 +467,11 @@ def _safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
                 raise ValueError(f"Unsafe artifact member path: {member.filename}")
         archive.extractall(root)
 
+
+def _file_sha256(path: Path) -> str:
+    """Return a streaming SHA-256 digest for artifact integrity checks."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

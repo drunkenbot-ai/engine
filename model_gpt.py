@@ -4,10 +4,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-
+from typing import Optional
 from .config import ModelConfig
-from .model_norm_lora import LayerNorm, make_norm
-from .model_transformer import RotaryEmbedding, CausalSelfAttention, MLP, Block
+from .model_norm_lora import make_norm
+from .model_transformer import Block
+
 
 class MicroGPT(nn.Module):
     """Small GPT-style causal language model."""

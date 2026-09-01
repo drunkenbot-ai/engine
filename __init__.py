@@ -7,11 +7,13 @@ __all__ = [
     "dataset_preview",
     "dataset_mixture",
     "export",
+    "gpu_discovery",
     "model",
     "resume_checks",
     "services",
     "tokenizer",
     "training",
     "training_orchestrator",
+    "training_worker",
+    "training_worker_protocol",
 ]
-

@@ -1,28 +1,161 @@
 ﻿from __future__ import annotations
 import json
 import math
-import os
-import random
-from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Optional, Union
+
 import numpy as np
-import numpy.lib.format as npy_format
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+
 from .config import ModelConfig, TrainingConfig, dataclass_to_jsonable
-from .model import MicroGPT, apply_lora_adapters, freeze_non_lora_parameters, load_lora_state_dict, lora_parameter_count, lora_state_dict, merge_lora_adapters
-try:
-    import psutil
-except ImportError:
-    psutil = None
-from .training_core import *
-from .training_runtime import *
-from .training_evaluation import *
-from .training_resume import *
+from .model import (
+    MicroGPT,
+    apply_lora_adapters,
+    freeze_non_lora_parameters,
+    load_lora_state_dict,
+    lora_adapter_count,
+    lora_parameter_count,
+)
+from .training_checkpoint import save_checkpoint
+from .training_evaluation import TrainingStopRequested, evaluate
+from .training_resume import (
+    _configure_cuda_allocator,
+    _estimated_training_vram_bytes,
+    _release_cuda_cache,
+    check_resume_compatibility,
+    latest_checkpoint,
+)
+from .training_runtime import (
+    ResumeCompatibilityReport,
+    TokenDataset,
+    TrainingResult,
+    amp_settings,
+    emit_progress,
+    make_optimizer,
+    make_scheduler,
+    set_seed,
+    system_cpu_percent,
+    system_ram_percent,
+)
+from .training_telemetry import TelemetryCadence
+
+
+def _model_weight_norm(model: MicroGPT) -> float:
+    """Compute one combined weight norm with a single device-to-host conversion."""
+
+    squared_norms = [
+        torch.linalg.vector_norm(parameter.detach().float()) ** 2
+        for parameter in model.parameters()
+    ]
+    if not squared_norms:
+        return 0.0
+    return float(torch.sqrt(torch.stack(squared_norms).sum()).item())
+
+
+def _system_metrics(
+    progress: Optional[Callable[[Any], None]],
+) -> dict[str, Optional[float]]:
+    """Sample host utilization only when an event consumer exists."""
+
+    if progress is None:
+        return {
+            "system_cpu_percent": None,
+            "system_ram_percent": None,
+        }
+    return {
+        "system_cpu_percent": system_cpu_percent(),
+        "system_ram_percent": system_ram_percent(),
+    }
+
+
+def _export_final_artifacts(
+    model: MicroGPT,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: GradScaler,
+    model_config: ModelConfig,
+    training_config: TrainingConfig,
+    global_step: int,
+    train_loss: float,
+    val_loss: Optional[float],
+    progress: Optional[Callable[[Any], None]] = None,
+) -> tuple[Path, Optional[Path]]:
+    """Write the chat-loadable final model while retaining a LoRA adapter export."""
+    adapter_path = None
+    if training_config.peft_method == "lora":
+        adapter_path = training_config.output_dir / "final_adapter.pt"
+        save_checkpoint(adapter_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, train_loss, val_loss, artifact_type="adapter")
+        merged_count = lora_adapter_count(model)
+        emit_progress(progress, f"Merged {merged_count} LoRA adapter module(s) into final model weights.", 96)
+    checkpoint_path = training_config.output_dir / "final_model.pt"
+    save_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, train_loss, val_loss, artifact_type="inference")
+    return checkpoint_path, adapter_path
+
+
+def _save_best_validation_artifacts(
+    checkpoints_dir: Path,
+    model: MicroGPT,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: GradScaler,
+    model_config: ModelConfig,
+    training_config: TrainingConfig,
+    global_step: int,
+    epoch: int,
+    train_loss: float,
+    val_loss: float,
+) -> tuple[Path, Path]:
+    """Save a chat-loadable best model and a separate resumable checkpoint."""
+
+    best_path = checkpoints_dir / "checkpoint_best_val.pt"
+    if training_config.peft_method == "lora":
+        resume_path = checkpoints_dir / "checkpoint_best_val_resume.pt"
+        save_checkpoint(
+            resume_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            model_config,
+            training_config,
+            global_step,
+            epoch,
+            train_loss,
+            val_loss,
+        )
+        save_checkpoint(
+            best_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            model_config,
+            training_config,
+            global_step,
+            epoch,
+            train_loss,
+            val_loss,
+            artifact_type="inference",
+        )
+        return best_path, resume_path
+    save_checkpoint(
+        best_path,
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        model_config,
+        training_config,
+        global_step,
+        epoch,
+        train_loss,
+        val_loss,
+    )
+    return best_path, best_path
 
 def train_model(model_config: ModelConfig, training_config: TrainingConfig, train_tokens: Union[list[int], np.ndarray], val_tokens: Union[list[int], np.ndarray], pad_token_id: int, progress: Optional[Callable[[Any], None]]=None, should_stop: Optional[Callable[[], bool]]=None, decode_preview: Optional[Callable[[list[int]], str]]=None) -> TrainingResult:
     """Train a MicroGPT model.
@@ -54,7 +187,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         estimate = _estimated_training_vram_bytes(model, model_config, training_config)
         emit_progress(progress, f'VRAM preflight: estimated {estimate / 1024 ** 3:.2f} GB; currently free {free_vram / 1024 ** 3:.2f} GB of {total_vram / 1024 ** 3:.2f} GB.', 3, estimated_vram_gb=estimate / 1024 ** 3, free_vram_gb=free_vram / 1024 ** 3)
         if estimate > free_vram * 0.85:
-            emit_progress(progress, '[WARN] Estimated training memory is close to available VRAM. Reduce micro-batch size, enable activation checkpointing, or use gradient accumulation.', 3)
+            emit_progress(progress, '[WARN] Estimated training memory is close to available VRAM. Reduce micro-batch size, enable activation checkpointing, or use gradient accumulation.', 3, event_type='warning')
     _release_cuda_cache()
     emit_progress(progress, 'Preparing token batches...', 4)
     loader_workers = max(0, int(training_config.data_loader_workers))
@@ -70,6 +203,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     final_val_loss: Optional[float] = None
     best_val_loss: Optional[float] = None
     best_checkpoint_path: Optional[Path] = None
+    best_resume_checkpoint_path: Optional[Path] = None
     early_stop_counter = 0
     early_stopped = False
     resume_path = training_config.resume_from_checkpoint if training_config.resume else None
@@ -104,11 +238,18 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     emit_progress(progress, f'Optimizer: {training_config.optimizer_name}, schedule: {training_config.scheduler_name}, precision: {training_config.precision}.', 5)
     if resume_path and Path(resume_path).exists():
         emit_progress(progress, f'Resuming from checkpoint: {resume_path}', 6)
+        checkpoint = resume_checkpoint or torch.load(resume_path, map_location='cpu')
+        artifact_type = checkpoint.get('artifact_type')
+        if artifact_type not in {None, 'resume'}:
+            raise ValueError(
+                f'Checkpoint {resume_path} is a {artifact_type} artifact and cannot '
+                'resume training. Select a resume checkpoint instead.'
+            )
         compatibility = resume_compatibility or check_resume_compatibility(Path(resume_path), model_config, training_config)
         for line in compatibility.info:
             emit_progress(progress, line, 6)
         for line in compatibility.warnings:
-            emit_progress(progress, f'[WARN] {line}', 6)
+            emit_progress(progress, f'[WARN] {line}', 6, event_type='warning')
         strict_resume_errors = list(compatibility.errors)
         if training_config.require_compatible_resume:
             if not compatibility.can_load_optimizer_state:
@@ -120,7 +261,6 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         if strict_resume_errors:
             message = 'Checkpoint is not compatible with the current training settings:\n' + '\n'.join((f'- {line}' for line in strict_resume_errors))
             raise ValueError(message)
-        checkpoint = resume_checkpoint or torch.load(resume_path, map_location='cpu')
         if training_config.peft_method == 'lora' and 'adapter_state_dict' in checkpoint:
             load_lora_state_dict(model, checkpoint['adapter_state_dict'])
         else:
@@ -149,7 +289,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         for line in compatibility.info:
             emit_progress(progress, line, 6)
         for line in compatibility.warnings:
-            emit_progress(progress, f'[WARN] {line}', 6)
+            emit_progress(progress, f'[WARN] {line}', 6, event_type='warning')
         if compatibility.errors:
             message = 'Fine-tune base checkpoint is not compatible with the current model settings:\n' + '\n'.join((f'- {line}' for line in compatibility.errors))
             raise ValueError(message)
@@ -160,77 +300,149 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         emit_progress(progress, 'Starting new training run.', 6)
     model.train()
     optimizer.zero_grad(set_to_none=True)
+
+    def finish_stopped(epoch_index: int, train_loss: float) -> TrainingResult:
+        stopped_path = checkpoints_dir / f'checkpoint_stopped_step_{global_step}.pt'
+        save_checkpoint(stopped_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch_index, train_loss, final_val_loss)
+        final_checkpoint_path, adapter_path = _export_final_artifacts(model, optimizer, scheduler, scaler, model_config, training_config, global_step, train_loss, final_val_loss, progress)
+        emit_progress(progress, f'Training stopped. Resume checkpoint saved: {stopped_path}', 100, event_type='stop')
+        summary_path = training_config.output_dir / 'training_summary.json'
+        summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': train_loss, 'final_val_loss': final_val_loss, 'total_steps': global_step, 'stopped': True, 'resume_checkpoint': str(stopped_path), 'recommended_checkpoint_path': str(final_checkpoint_path), 'adapter_checkpoint': str(adapter_path) if adapter_path else None, 'parameters': sum((p.numel() for p in model.parameters()))}
+        summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
+        return TrainingResult(stopped_path, summary_path, train_loss, final_val_loss, stopped=True)
+
+    cadence = TelemetryCadence(
+        metrics_interval_seconds=training_config.telemetry_interval_seconds,
+        stability_interval_seconds=training_config.stability_metrics_interval_seconds,
+        preview_interval_seconds=training_config.preview_interval_seconds,
+    )
     last_metric_time = perf_counter()
+    steps_since_metric = 0
+    samples_since_metric = 0
+    tokens_since_metric = 0
     step_time_window: list[float] = []
     for epoch in range(start_epoch, training_config.epochs):
-        epoch_losses: list[float] = []
+        epoch_loss_sum: Optional[torch.Tensor] = None
+        epoch_loss_count = 0
+        latest_loss_scalar: Optional[float] = None
         epoch_batch_count = len(train_loader)
         for batch_index, (x, y) in enumerate(train_loader):
             if should_stop and should_stop():
-                final_train_loss = sum(epoch_losses) / max(len(epoch_losses), 1) if epoch_losses else final_train_loss
-                stopped_path = checkpoints_dir / f'checkpoint_stopped_step_{global_step}.pt'
-                save_checkpoint(stopped_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch, final_train_loss, final_val_loss)
-                emit_progress(progress, f'Training stopped. Resume checkpoint saved: {stopped_path}', 100)
-                summary_path = training_config.output_dir / 'training_summary.json'
-                summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'total_steps': global_step, 'stopped': True, 'resume_checkpoint': str(stopped_path), 'parameters': sum((p.numel() for p in model.parameters()))}
-                summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
-                return TrainingResult(stopped_path, summary_path, final_train_loss, final_val_loss, stopped=True)
+                if epoch_loss_sum is not None:
+                    final_train_loss = float((epoch_loss_sum / max(epoch_loss_count, 1)).item())
+                return finish_stopped(epoch, final_train_loss)
             x = x.to(training_config.device, non_blocking=pin_memory)
             y = y.to(training_config.device, non_blocking=pin_memory)
             with autocast('cuda', enabled=use_autocast, dtype=autocast_dtype):
                 logits = model(x)
                 loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=pad_token_id)
                 loss = loss / training_config.gradient_accumulation
+            batch_loss = loss.detach() * training_config.gradient_accumulation
+            epoch_loss_sum = batch_loss if epoch_loss_sum is None else epoch_loss_sum + batch_loss
+            epoch_loss_count += 1
+            samples_since_metric += int(x.shape[0])
+            tokens_since_metric += int(x.numel())
             scaler.scale(loss).backward()
             should_step = (batch_index + 1) % training_config.gradient_accumulation == 0 or batch_index + 1 == epoch_batch_count
             if should_step:
                 scaler.unscale_(optimizer)
                 grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.max_grad_norm)
-                grad_norm = float(grad_norm_tensor.item() if hasattr(grad_norm_tensor, 'item') else grad_norm_tensor)
-                weight_norm = math.sqrt(sum((float(parameter.detach().float().norm(2).item()) ** 2 for parameter in model.parameters())))
                 learning_rate = float(scheduler.get_last_lr()[0])
-                update_ratio = learning_rate * grad_norm / max(weight_norm, 1e-12)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 global_step += 1
-                now = perf_counter()
-                step_seconds = max(now - last_metric_time, 1e-09)
-                last_metric_time = now
-                step_time_window.append(step_seconds)
-                step_time_window = step_time_window[-50:]
-                average_step_seconds = sum(step_time_window) / max(len(step_time_window), 1)
-                remaining_steps = max(total_steps - global_step, 0)
-                eta_seconds = remaining_steps * average_step_seconds
-                samples_seen = training_config.batch_size * training_config.gradient_accumulation
-                tokens_seen = samples_seen * model_config.context_length
-                vram_allocated_gb = None
-                vram_reserved_gb = None
-                gpu_memory_percent = None
-                if training_config.device.startswith('cuda') and torch.cuda.is_available():
-                    device_index = torch.cuda.current_device()
-                    vram_allocated_gb = torch.cuda.memory_allocated(device_index) / 1024 ** 3
-                    vram_reserved_gb = torch.cuda.memory_reserved(device_index) / 1024 ** 3
-                    free_vram, total_vram = torch.cuda.mem_get_info(device_index)
-                    gpu_memory_percent = 100.0 * (1.0 - free_vram / max(total_vram, 1))
-                sample_text = None
-                if decode_preview is not None:
-                    try:
-                        sample_text = decode_preview(x[0].detach().cpu().tolist())
-                    except Exception:
-                        sample_text = None
+                steps_since_metric += 1
                 current_progress = 8 + int(86 * min(global_step, total_steps) / max(total_steps, 1))
-                emit_progress(progress, f'Epoch {epoch + 1}/{training_config.epochs}, step {global_step}/{total_steps}, loss {float(loss.item() * training_config.gradient_accumulation):.4f}', current_progress, epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=float(loss.item() * training_config.gradient_accumulation), val_loss=final_val_loss, learning_rate=learning_rate, grad_norm=grad_norm, weight_norm=weight_norm, update_ratio=update_ratio, tokens_per_second=tokens_seen / step_seconds, samples_per_second=samples_seen / step_seconds, step_seconds=step_seconds, average_step_seconds=average_step_seconds, eta_seconds=eta_seconds, remaining_steps=remaining_steps, vram_allocated_gb=vram_allocated_gb, vram_reserved_gb=vram_reserved_gb, gpu_memory_percent=gpu_memory_percent, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent(), data_loader_workers=loader_workers, sample_text=sample_text)
+                if progress is not None and (sample := cadence.sample()).metrics:
+                    step_seconds = max(sample.sampled_at - last_metric_time, 1e-09)
+                    last_metric_time = sample.sampled_at
+                    average_step_seconds = step_seconds / max(steps_since_metric, 1)
+                    step_time_window.append(average_step_seconds)
+                    step_time_window = step_time_window[-50:]
+                    average_step_seconds = sum(step_time_window) / max(len(step_time_window), 1)
+                    remaining_steps = max(total_steps - global_step, 0)
+                    eta_seconds = remaining_steps * average_step_seconds
+                    steps_since_metric = 0
+                    samples_seen = samples_since_metric
+                    tokens_seen = tokens_since_metric
+                    samples_since_metric = 0
+                    tokens_since_metric = 0
+                    latest_loss_scalar = float(batch_loss.item())
+                    grad_norm = None
+                    weight_norm = None
+                    update_ratio = None
+                    if sample.stability:
+                        grad_norm = float(
+                            grad_norm_tensor.item()
+                            if hasattr(grad_norm_tensor, 'item')
+                            else grad_norm_tensor
+                        )
+                        weight_norm = _model_weight_norm(model)
+                        update_ratio = learning_rate * grad_norm / max(weight_norm, 1e-12)
+                    vram_allocated_gb = None
+                    vram_reserved_gb = None
+                    gpu_memory_percent = None
+                    if training_config.device.startswith('cuda') and torch.cuda.is_available():
+                        device_index = torch.cuda.current_device()
+                        vram_allocated_gb = torch.cuda.memory_allocated(device_index) / 1024 ** 3
+                        vram_reserved_gb = torch.cuda.memory_reserved(device_index) / 1024 ** 3
+                        free_vram, total_vram = torch.cuda.mem_get_info(device_index)
+                        gpu_memory_percent = 100.0 * (1.0 - free_vram / max(total_vram, 1))
+                    sample_text = None
+                    if sample.preview and decode_preview is not None:
+                        try:
+                            sample_text = decode_preview(x[0].detach().cpu().tolist())
+                        except Exception:
+                            sample_text = None
+                    emit_progress(
+                        progress,
+                        f'Epoch {epoch + 1}/{training_config.epochs}, step {global_step}/{total_steps}, loss {latest_loss_scalar:.4f}',
+                        current_progress,
+                        event_type='metrics',
+                        epoch=epoch + 1,
+                        total_epochs=training_config.epochs,
+                        step=global_step,
+                        total_steps=total_steps,
+                        train_loss=latest_loss_scalar,
+                        val_loss=final_val_loss,
+                        learning_rate=learning_rate,
+                        grad_norm=grad_norm,
+                        weight_norm=weight_norm,
+                        update_ratio=update_ratio,
+                        tokens_per_second=tokens_seen / step_seconds,
+                        samples_per_second=samples_seen / step_seconds,
+                        step_seconds=step_seconds,
+                        average_step_seconds=average_step_seconds,
+                        eta_seconds=eta_seconds,
+                        remaining_steps=remaining_steps,
+                        vram_allocated_gb=vram_allocated_gb,
+                        vram_reserved_gb=vram_reserved_gb,
+                        gpu_memory_percent=gpu_memory_percent,
+                        **_system_metrics(progress),
+                        data_loader_workers=loader_workers,
+                        sample_text=sample_text,
+                    )
                 if val_loader is not None and training_config.eval_interval > 0 and (global_step % training_config.eval_interval == 0):
-                    emit_progress(progress, f'Running validation at step {global_step}...', current_progress, epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=float(loss.item() * training_config.gradient_accumulation), val_loss=final_val_loss, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent())
-                    final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, current_progress)
-                    emit_progress(progress, f'Validation loss at step {global_step}: {final_val_loss:.4f}', current_progress, epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=epoch_losses[-1] if epoch_losses else None, val_loss=final_val_loss, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent())
+                    if latest_loss_scalar is None:
+                        latest_loss_scalar = float(batch_loss.item())
+                    emit_progress(progress, f'Running validation at step {global_step}...', current_progress, event_type='validation', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=latest_loss_scalar, val_loss=final_val_loss, **_system_metrics(progress))
+                    try:
+                        final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, current_progress)
+                    except TrainingStopRequested:
+                        current_train_loss = float((epoch_loss_sum / max(epoch_loss_count, 1)).item()) if epoch_loss_sum is not None else final_train_loss
+                        return finish_stopped(epoch, current_train_loss)
+                    emit_progress(progress, f'Validation loss at step {global_step}: {final_val_loss:.4f}', current_progress, event_type='validation', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=latest_loss_scalar, val_loss=final_val_loss, **_system_metrics(progress))
                     if best_val_loss is None or final_val_loss < best_val_loss:
                         best_val_loss = final_val_loss
-                        best_checkpoint_path = checkpoints_dir / 'checkpoint_best_val.pt'
-                        save_checkpoint(best_checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch + 1, epoch_losses[-1] if epoch_losses else final_train_loss, final_val_loss)
-                        emit_progress(progress, f'New best validation checkpoint: {best_checkpoint_path.name} ({best_val_loss:.4f}).', current_progress, checkpoint_quality='best_validation', best_val_loss=best_val_loss, best_checkpoint_path=str(best_checkpoint_path))
+                        best_checkpoint_path, best_resume_checkpoint_path = _save_best_validation_artifacts(
+                            checkpoints_dir, model, optimizer, scheduler, scaler,
+                            model_config, training_config, global_step, epoch + 1,
+                            latest_loss_scalar if latest_loss_scalar is not None else final_train_loss,
+                            final_val_loss,
+                        )
+                        emit_progress(progress, f'New best validation checkpoint: {best_checkpoint_path.name} ({best_val_loss:.4f}).', current_progress, event_type='checkpoint', checkpoint_quality='best_validation', best_val_loss=best_val_loss, best_checkpoint_path=str(best_checkpoint_path))
                         early_stop_counter = 0
                     elif training_config.early_stopping and best_val_loss is not None:
                         early_stop_counter += 1
@@ -240,18 +452,25 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                             early_stopped = True
                             break
                 if training_config.save_interval > 0 and global_step % training_config.save_interval == 0:
-                    save_checkpoint(checkpoints_dir / f'checkpoint_{global_step}.pt', model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch + 1, final_train_loss, final_val_loss)
-                    emit_progress(progress, f'Saved checkpoint at step {global_step}.', current_progress)
-            epoch_losses.append(float(loss.item() * training_config.gradient_accumulation))
+                    checkpoint_train_loss = float((epoch_loss_sum / max(epoch_loss_count, 1)).item()) if epoch_loss_sum is not None else final_train_loss
+                    save_checkpoint(checkpoints_dir / f'checkpoint_{global_step}.pt', model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch + 1, checkpoint_train_loss, final_val_loss)
+                    emit_progress(progress, f'Saved checkpoint at step {global_step}.', current_progress, event_type='checkpoint')
         if early_stopped:
             break
-        final_train_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
+        if epoch_loss_sum is not None:
+            final_train_loss = float((epoch_loss_sum / max(epoch_loss_count, 1)).item())
         if val_loader is not None:
-            final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)))
+            try:
+                final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)))
+            except TrainingStopRequested:
+                return finish_stopped(epoch + 1, final_train_loss)
             if best_val_loss is None or final_val_loss < best_val_loss:
                 best_val_loss = final_val_loss
-                best_checkpoint_path = checkpoints_dir / 'checkpoint_best_val.pt'
-                save_checkpoint(best_checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch + 1, final_train_loss, final_val_loss)
+                best_checkpoint_path, best_resume_checkpoint_path = _save_best_validation_artifacts(
+                    checkpoints_dir, model, optimizer, scheduler, scaler,
+                    model_config, training_config, global_step, epoch + 1,
+                    final_train_loss, final_val_loss,
+                )
                 emit_progress(progress, f'New best validation checkpoint: {best_checkpoint_path.name} ({best_val_loss:.4f}).', 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)), checkpoint_quality='best_validation', best_val_loss=best_val_loss, best_checkpoint_path=str(best_checkpoint_path))
                 early_stop_counter = 0
             elif training_config.early_stopping and best_val_loss is not None:
@@ -262,20 +481,12 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                     early_stopped = True
         print(f'epoch {epoch + 1}/{training_config.epochs}: train_loss={final_train_loss:.4f}')
         save_checkpoint(checkpoints_dir / f'checkpoint_epoch_{epoch + 1}.pt', model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch + 1, final_train_loss, final_val_loss)
-        emit_progress(progress, f'Epoch {epoch + 1} complete. Checkpoint saved.', 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)), epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent())
+        emit_progress(progress, f'Epoch {epoch + 1} complete. Checkpoint saved.', 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)), event_type='checkpoint', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss, **_system_metrics(progress))
         if early_stopped:
             break
-    if training_config.peft_method == 'lora':
-        adapter_path = training_config.output_dir / 'final_adapter.pt'
-        save_checkpoint(adapter_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, final_train_loss, final_val_loss)
-        merged_count = merge_lora_adapters(model)
-        emit_progress(progress, f'Merged {merged_count} LoRA adapter module(s) into final model weights.', 96)
-    checkpoint_path = training_config.output_dir / 'final_model.pt'
-    save_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, final_train_loss, final_val_loss)
+    checkpoint_path, adapter_path = _export_final_artifacts(model, optimizer, scheduler, scaler, model_config, training_config, global_step, final_train_loss, final_val_loss, progress)
     summary_path = training_config.output_dir / 'training_summary.json'
-    summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'best_val_loss': best_val_loss, 'best_checkpoint_path': str(best_checkpoint_path) if best_checkpoint_path else None, 'recommended_checkpoint_path': str(best_checkpoint_path or checkpoint_path), 'total_steps': global_step, 'parameters': sum((p.numel() for p in model.parameters())), 'adapter_checkpoint': str(training_config.output_dir / 'final_adapter.pt') if training_config.peft_method == 'lora' else None, 'early_stopped': early_stopped}
+    summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'best_val_loss': best_val_loss, 'best_checkpoint_path': str(best_checkpoint_path) if best_checkpoint_path else None, 'best_resume_checkpoint_path': str(best_resume_checkpoint_path) if best_resume_checkpoint_path else None, 'recommended_checkpoint_path': str(best_checkpoint_path or checkpoint_path), 'total_steps': global_step, 'parameters': sum((p.numel() for p in model.parameters())), 'adapter_checkpoint': str(training_config.output_dir / 'final_adapter.pt') if training_config.peft_method == 'lora' else None, 'early_stopped': early_stopped}
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
-    emit_progress(progress, 'Training stopped early - validation loss converged.' if early_stopped else 'Training complete.', 100, epoch=training_config.epochs, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss)
+    emit_progress(progress, 'Training stopped early - validation loss converged.' if early_stopped else 'Training complete.', 100, event_type='completion', epoch=training_config.epochs, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss)
     return TrainingResult(checkpoint_path, summary_path, final_train_loss, final_val_loss)
-from .training_resume import _release_cuda_cache, _configure_cuda_allocator, _estimated_training_vram_bytes
-from .training_checkpoint import save_checkpoint

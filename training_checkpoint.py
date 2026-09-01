@@ -1,43 +1,20 @@
 ﻿from __future__ import annotations
 
-import json
-import math
-import os
-import random
-from dataclasses import dataclass
 from pathlib import Path
-from time import perf_counter
-from typing import Any, Callable, Optional, Union
+from typing import Literal, Optional
 
-import numpy as np
-import numpy.lib.format as npy_format
 import torch
-import torch.nn.functional as F
-from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset
+from torch.amp import GradScaler
 
 from .config import ModelConfig, TrainingConfig, dataclass_to_jsonable
 from .model import (
     MicroGPT,
-    apply_lora_adapters,
-    freeze_non_lora_parameters,
-    load_lora_state_dict,
-    lora_parameter_count,
     lora_state_dict,
-    merge_lora_adapters,
+    merged_lora_state_dict,
 )
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
+CheckpointArtifact = Literal["resume", "adapter", "inference"]
 
-
-
-from .training_core import *
-from .training_runtime import *
-from .training_evaluation import *
-from .training_resume import *
 
 def save_checkpoint(
     path: Path,
@@ -51,8 +28,9 @@ def save_checkpoint(
     epoch: int,
     train_loss: float,
     val_loss: Optional[float],
+    artifact_type: CheckpointArtifact = "resume",
 ) -> None:
-    """Save a resumable training checkpoint.
+    """Save a resume, adapter, or chat-loadable inference artifact.
 
     Args:
         path: Destination checkpoint path.
@@ -66,12 +44,18 @@ def save_checkpoint(
         epoch: Current epoch number.
         train_loss: Most recent training loss.
         val_loss: Most recent validation loss.
+        artifact_type: Explicit artifact semantics. Resume artifacts include
+            optimizer state, adapter artifacts contain LoRA deltas, and
+            inference artifacts contain complete plain-model weights.
     """
 
+    if artifact_type not in {"resume", "adapter", "inference"}:
+        raise ValueError(f"Unsupported checkpoint artifact type: {artifact_type}")
+    if artifact_type == "adapter" and training_config.peft_method != "lora":
+        raise ValueError("Adapter checkpoints require LoRA training.")
+
     payload = {
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
+        "artifact_type": artifact_type,
         "model_config": dataclass_to_jsonable(model_config),
         "training_config": dataclass_to_jsonable(training_config),
         "global_step": global_step,
@@ -79,7 +63,15 @@ def save_checkpoint(
         "train_loss": train_loss,
         "val_loss": val_loss,
     }
-    if training_config.peft_method == "lora" and path.name != "final_model.pt":
+    if artifact_type == "resume":
+        payload.update(
+            {
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+            }
+        )
+    if training_config.peft_method == "lora" and artifact_type in {"resume", "adapter"}:
         payload["adapter_state_dict"] = lora_state_dict(model)
         payload["fine_tune_base_checkpoint"] = (
             str(training_config.fine_tune_from_checkpoint)
@@ -92,8 +84,11 @@ def save_checkpoint(
             "dropout": training_config.lora_dropout,
             "target_modules": training_config.lora_target_modules,
         }
+    elif training_config.peft_method == "lora":
+        payload["model_state_dict"] = merged_lora_state_dict(model)
     else:
-        payload["model_state_dict"] = model.state_dict()
+        payload["model_state_dict"] = {
+            name: tensor.detach().cpu()
+            for name, tensor in model.state_dict().items()
+        }
     torch.save(payload, path)
-from .training_resume import _release_cuda_cache, _configure_cuda_allocator, _estimated_training_vram_bytes
-

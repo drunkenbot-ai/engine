@@ -1,11 +1,13 @@
 ﻿from __future__ import annotations
 
+import argparse
 import json
+import os
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
-from .conversation_presets import *
-from .conversation_loader import *
+from .conversation_presets import CONVERSATION_DATASET_PRESETS
+from .data import clean_text
 
 def _conversation_text_from_row(row: dict[str, Any]) -> tuple[str, str]:
     """Extract tagged conversation/instruction text from a dataset row.
@@ -80,6 +82,24 @@ def _render_message_list(messages: list[Any]) -> str:
             label = "System"
         turns.append(f"{label}: {content}")
     return "\n".join(turns)
+
+
+def _hf_subprocess_environment(cache_dir: Path) -> dict[str, str]:
+    """Build a Hugging Face environment that stays inside the project cache.
+
+    Args:
+        cache_dir: Project-local Hugging Face cache directory.
+
+    Returns:
+        Environment variables for the extraction subprocess.
+    """
+
+    env = os.environ.copy()
+    env["HF_HOME"] = str(cache_dir / "hf_home")
+    env["HF_HUB_CACHE"] = str(cache_dir / "hub")
+    env["HF_DATASETS_CACHE"] = str(cache_dir / "datasets")
+    env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    return env
 
 
 def _extract_preset_to_jsonl(
@@ -212,4 +232,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

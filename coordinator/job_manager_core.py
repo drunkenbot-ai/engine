@@ -1,12 +1,9 @@
 ﻿from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from enum import Enum
-from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
-from engine.backends.base import ProgressCallback, StopCallback, TrainerBackend
+from engine.backends.base import ProgressCallback, StopCallback
 from engine.backends.registry import DEFAULT_BACKEND_REGISTRY, BackendRegistry
 from engine.contracts import (
     BackendKind,
@@ -24,15 +21,43 @@ from engine.contracts import (
     ProtocolStatus,
     RegisterWorkerRequest,
     RegisterWorkerResponse,
-    TrainingMetrics,
     TrainingJobSpec,
-    TrainingResultSpec,
     WorkerAvailability,
     utc_now_iso,
 )
 from engine.coordinator.state_store import JobStateStore
-from engine.coordinator.job_models import ManagedJob, WorkerDescriptor, WorkerStatus
+from engine.coordinator.job_models import ManagedJob, WorkerDescriptor, WorkerHeartbeat, WorkerStatus
 from engine.training import TrainingResult
+
+
+def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Parse a stored ISO timestamp for worker-staleness checks."""
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.astimezone() if parsed.tzinfo is None else parsed
+
+
+def _availability_to_worker_status(availability: WorkerAvailability) -> WorkerStatus:
+    """Convert the wire-level availability enum into stored worker status."""
+    return {
+        WorkerAvailability.AVAILABLE: WorkerStatus.AVAILABLE,
+        WorkerAvailability.BUSY: WorkerStatus.BUSY,
+        WorkerAvailability.OFFLINE: WorkerStatus.OFFLINE,
+    }[availability]
+
+
+def _control_message(should_stop: bool, should_pause: bool, default: str) -> str:
+    """Return the remote worker control state as a human-readable message."""
+    if should_stop:
+        return "stop requested"
+    if should_pause:
+        return "pause requested"
+    return default
 
 
 class JobManagerCore:
@@ -472,4 +497,3 @@ class JobManagerCore:
             if managed.spec.status == JobStatus.QUEUED:
                 return self.run_job(managed.spec.job_id, progress=progress, should_stop=should_stop)
         raise ValueError("No queued training jobs are available")
-

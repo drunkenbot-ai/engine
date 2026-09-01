@@ -17,7 +17,6 @@ from .export import export_hf_microgpt_package
 from .dataset_build import build_dataset
 from .training_orchestrator import train_from_dataset
 from .tokenizer import load_tokenizer
-from .worker import WorkerClientConfig, run_worker_client
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -65,6 +64,7 @@ def prepare(args: argparse.Namespace) -> None:
         dataset_stage=args.dataset_stage,
         conversation_datasets=[item.strip() for item in args.conversation_datasets.split(",") if item.strip()],
         conversation_sample_limit=args.conversation_sample_limit,
+        tool_call_dataset_paths=[Path(path) for path in args.tool_call_dataset.split(",") if path.strip()],
         fast_scan_mode=args.fast_scan_mode,
         fast_scan_sample_bytes=args.fast_scan_sample_bytes,
         strict_duplicate_verification=args.strict_duplicate_verification,
@@ -74,7 +74,12 @@ def prepare(args: argparse.Namespace) -> None:
         f"Documents: {result.document_count} | Characters: {result.character_count} | "
         f"Tokens: {result.token_count} | Vocab: {result.vocab_size}"
     )
-    print(f"Cache: reused {result.cached_file_count} file(s) | processed {result.processed_file_count} file(s)")
+    print(
+        f"Sources: reused {result.cached_file_count} clean file(s) | "
+        f"processed {result.processed_file_count} clean file(s) | "
+        f"partial {result.partial_file_count} file(s) | "
+        f"failed {result.failed_file_count} file(s)"
+    )
 
 
 def train(args: argparse.Namespace) -> None:
@@ -222,6 +227,8 @@ def worker_client(args: argparse.Namespace) -> None:
         args: Parsed command-line arguments for the worker client command.
     """
 
+    from .worker import WorkerClientConfig, run_worker_client
+
     labels = [item.strip() for item in args.labels.split(",") if item.strip()]
     config = WorkerClientConfig(
         coordinator_url=args.coordinator_url,
@@ -279,9 +286,14 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--tokenizer_path", default=None)
     prepare_parser.add_argument(
         "--dataset_stage",
-        choices=["base", "instruction", "conversation"],
+        choices=["base", "instruction", "conversation", "code", "tool_call"],
         default="base",
-        help="Purpose for online datasets: base pretraining, instruction fine-tune, or conversation fine-tune.",
+        help="Dataset purpose, including local tool-call fine-tune examples.",
+    )
+    prepare_parser.add_argument(
+        "--tool_call_dataset",
+        default="",
+        help="Comma-separated JSON/JSONL paths containing OpenAI-style tool-call examples.",
     )
     prepare_parser.add_argument(
         "--conversation_datasets",
@@ -401,4 +413,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,14 +1,14 @@
-﻿from __future__ import annotations
+﻿# ruff: noqa: F403, F405
+from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Optional
-from uuid import uuid4
 
-from engine.contracts.jobs import BackendKind, TrainingJobSpec, TrainingMetrics, TrainingResultSpec, utc_now_iso
+from engine.contracts.jobs import BackendKind, TrainingJobSpec, TrainingMetrics
 
 
 from .protocol_types import *
+from .protocol_types import _restore_envelope
 class RegisterWorkerRequest(ProtocolEnvelope):
     """Request sent by a worker to join the coordinator."""
 
@@ -483,6 +483,5 @@ class ProgressReportResponse(ProtocolEnvelope):
             "should_pause_job": self.should_pause_job,
             "message": self.message,
         }
-
 
 

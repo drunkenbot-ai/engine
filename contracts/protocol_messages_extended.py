@@ -1,14 +1,14 @@
-﻿from __future__ import annotations
+﻿# ruff: noqa: F403, F405
+from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 from typing import Any, Optional
-from uuid import uuid4
 
-from engine.contracts.jobs import BackendKind, TrainingJobSpec, TrainingMetrics, TrainingResultSpec, utc_now_iso
+from engine.contracts.jobs import TrainingResultSpec
 
 
 from .protocol_types import *
+from .protocol_types import _restore_envelope
 @dataclass
 class CompleteJobRequest(ProtocolEnvelope):
     """Completion report sent by a worker."""
@@ -187,19 +187,6 @@ class FailJobResponse(ProtocolEnvelope):
         }
 
 
-def _restore_envelope(message: ProtocolEnvelope, data: dict[str, Any]) -> None:
-    """Restore envelope fields on a protocol message.
-
-    Args:
-        message: Protocol message.
-        data: Serialized message data.
-    """
-
-    message.message_id = data.get("message_id", message.message_id)
-    message.sent_at = data.get("sent_at", message.sent_at)
-    message.protocol_version = data.get("protocol_version", message.protocol_version)
-
-
 def _result_to_jsonable(result: TrainingResultSpec) -> dict[str, Any]:
     """Convert a result spec to JSON-friendly values.
 
@@ -247,4 +234,3 @@ def _result_from_jsonable(data: dict[str, Any]) -> TrainingResultSpec:
         error=data.get("error"),
         artifact_bundle_url=data.get("artifact_bundle_url"),
     )
-

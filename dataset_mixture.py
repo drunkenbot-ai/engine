@@ -7,11 +7,18 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .conversation_datasets import CONVERSATION_DATASET_PRESETS
-from .data import Document, SUPPORTED_CODE_SUFFIXES
+from .data import Document
 
 LOGGER = logging.getLogger(__name__)
 
 AGGREGATE_MIXTURE_FAMILIES: set[str] = set()
+MIXTURE_LABELS = {
+    "local_prose",
+    "source_code",
+    "instruction",
+    "conversation",
+    "online_base",
+}
 MIXTURE_CHUNK_CHARS = 25_000
 # A default corpus must not gain apparent scale by repeating a tiny template.
 # This threshold is deliberately conservative: it only applies once a document
@@ -373,4 +380,3 @@ __all__ = [
     "_filter_repetitive_documents",
     "MAX_REPETITIVE_UNIT_RATIO",
 ]
-

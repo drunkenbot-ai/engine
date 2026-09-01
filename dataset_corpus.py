@@ -1,18 +1,17 @@
 ﻿from __future__ import annotations
 import hashlib
-import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from .data import Document, format_document_for_training
-from .dataset_mixture import (
-    MAX_REPETITIVE_UNIT_RATIO,
-    MIN_REPETITION_CHECK_CHARS,
-    MIN_REPETITION_CHECK_UNITS,
-    _canonical_corpus_block,
-    _content_units_for_diversity,
-)
+from .dataset_mixture import (MAX_REPETITIVE_UNIT_RATIO,
+                              MIN_REPETITION_CHECK_CHARS,
+                                MIN_REPETITION_CHECK_UNITS,
+                                _canonical_corpus_block,
+                                _content_units_for_diversity
+                              )
+
 
 @dataclass
 class _CorpusBuildStats:

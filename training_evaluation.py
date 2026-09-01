@@ -1,9 +1,20 @@
 ﻿from __future__ import annotations
+
 from typing import Any, Callable, Optional
+
 import torch
 import torch.nn.functional as F
-from .training_runtime import *
+from torch.utils.data import DataLoader
+
+from .model import MicroGPT
 from .training_resume import _release_cuda_cache
+from .training_runtime import emit_progress, system_cpu_percent, system_ram_percent
+
+
+class TrainingStopRequested(RuntimeError):
+    """Signal cooperative cancellation from inside validation."""
+
+
 def evaluate(
     model: MicroGPT,
     loader: DataLoader,
@@ -38,7 +49,7 @@ def evaluate(
         for batch_index, (x, y) in enumerate(loader, start=1):
             if should_stop and should_stop():
                 model.train()
-                raise RuntimeError("Training stopped by user during validation.")
+                raise TrainingStopRequested("Training stopped by user during validation.")
             if batch_index > batch_limit:
                 break
             x = x.to(device)
@@ -65,4 +76,3 @@ def evaluate(
     model.train()
     _release_cuda_cache()
     return sum(losses) / max(len(losses), 1)
-

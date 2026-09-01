@@ -9,15 +9,16 @@ import numpy as np
 from .config import DatasetConfig, dataclass_to_jsonable
 from .data import file_sha256
 from .dataset_corpus import _StreamingCorpusBuilder
-from .dataset_helpers import _emit, _local_structured_dataset_paths
 from .dataset_loader import _load_documents_with_cache
 from .dataset_mixture import MAX_REPETITIVE_UNIT_RATIO
 from .dataset_quality import _dataset_quality_report
 from .dataset_tokenizer import _load_or_create_tokenizer
 from .lineage import record_dataset_version, write_json
-from .tokenizer import encode_file_to_npy, save_tokenizer_package, token_dtype_for_vocab, validate_training_tokenizer
+from .tokenizer import encode_file_to_npy, save_tokenizer_package, \
+    token_dtype_for_vocab, validate_training_tokenizer
 
 LOGGER = logging.getLogger(__name__)
+
 
 @dataclass
 class DatasetBuildResult:
@@ -39,9 +40,12 @@ class DatasetBuildResult:
         prose_sample_count: Number of prose samples.
         conversation_sample_count: Number of conversation/instruction samples.
         cached_file_count: Number of unchanged source files reused from cache.
-        processed_file_count: Number of source files extracted this run.
+        processed_file_count: Number of clean source files extracted this run.
+        partial_file_count: Number of files with usable and invalid records.
         skipped_file_count: Number of files with no readable text.
-        failed_file_count: Number of files that failed extraction.
+        failed_file_count: Number of files that produced no usable records.
+        invalid_record_count: Total malformed or schema-invalid record count.
+        preparation_outcome: Terminal preparation outcome.
         dataset_version_id: Unique dataset version identifier.
         dataset_version_number: One-based dataset version number.
         mixture_report: Per-source family sampling report.
@@ -86,10 +90,17 @@ class DatasetBuildResult:
     corpus_block_count: int = 0
     duplicate_block_ratio: float = 0.0
     unique_block_ratio: float = 1.0
+    partial_file_count: int = 0
+    invalid_record_count: int = 0
+    preparation_outcome: str = "completed"
 
 
-def _emit(progress: Optional[Callable[[Any], None]], message: str,
-          percent: Optional[int] = None) -> None:
+def _emit(
+    progress: Optional[Callable[[Any], None]],
+    message: str,
+    percent: Optional[int] = None,
+    **metadata: Any,
+) -> None:
     """Emit a progress event if a callback is available.
 
     Args:
@@ -100,7 +111,7 @@ def _emit(progress: Optional[Callable[[Any], None]], message: str,
 
     LOGGER.info(message)
     if progress:
-        progress({"message": message, "percent": percent})
+        progress({"message": message, "percent": percent, **metadata})
 
 
 def estimate_vocab_size(character_count: int, unique_word_count: int) -> int:
@@ -144,6 +155,8 @@ def content_warning(character_count: int) -> Optional[str]:
     if character_count < 100_000:
         return "The corpus is modest. Use more text for better generations and reasoning behavior."
     return None
+
+
 def build_dataset(
         config: DatasetConfig,
         progress: Optional[Callable[[Any], None]] = None,
@@ -183,15 +196,26 @@ def build_dataset(
         manifest,
         cached_file_count,
         processed_file_count,
+        partial_file_count,
         skipped_file_count,
         failed_file_count,
-    ) = _load_documents_with_cache(config, corpus_builder, progress, should_stop)
+        invalid_record_count,
+    ) = _load_documents_with_cache(config, corpus_builder, progress,
+                                   should_stop)
     duplicate_report = corpus_builder.close()
     stats = corpus_builder.stats
     if should_stop and should_stop():
         raise RuntimeError("Dataset preparation stopped by user.")
     if stats.accepted_document_count == 0:
         corpus_path.unlink(missing_ok=True)
+        manifest.set_meta("preparation_outcome", "failed", commit=False)
+        manifest.set_meta(
+            "invalid_record_count",
+            invalid_record_count,
+            commit=False,
+        )
+        manifest.commit()
+        manifest.close()
         raise ValueError(
             "No supported text, PDF, JSONL, or structured JSON documents were found.")
     if stats.exact_duplicates_removed:
@@ -246,9 +270,11 @@ def build_dataset(
         _emit(progress,
               f"Conversation data: {conversation_sample_count:,} dialogue/instruction samples.",
               46)
-    if cached_file_count or processed_file_count:
+    if cached_file_count or processed_file_count or partial_file_count:
         _emit(progress,
-              f"Cache: reused {cached_file_count:,} file(s), processed {processed_file_count:,} file(s).",
+              f"Sources: reused {cached_file_count:,} clean file(s), "
+              f"processed {processed_file_count:,} clean file(s), "
+              f"completed {partial_file_count:,} file(s) with warnings.",
               47)
     if skipped_file_count or failed_file_count:
         _emit(progress,
@@ -296,13 +322,16 @@ def build_dataset(
     token_dtype = token_dtype_for_vocab(tokenizer.get_vocab_size())
     all_tokens_path = config.output_dir / "all_tokens.npy"
     token_count = encode_file_to_npy(
-        tokenizer, corpus_path, all_tokens_path, token_dtype, should_stop=should_stop
+        tokenizer, corpus_path, all_tokens_path, token_dtype,
+        should_stop=should_stop
     )
     _emit(progress, f"Encoded {token_count:,} tokens.", 86)
 
-    token_density = (token_count / max(character_count, 1)) if character_count else 0.0
+    token_density = (token_count / max(character_count,
+                                       1)) if character_count else 0.0
     document_token_lengths = [max(1, int(round(char_len * token_density)))
-                              for char_len in stats.document_char_lengths if char_len]
+                              for char_len in stats.document_char_lengths if
+                              char_len]
     if document_token_lengths:
         sequence_stats = {
             "min": min(document_token_lengths),
@@ -367,6 +396,11 @@ def build_dataset(
         94,
     )
 
+    preparation_outcome = (
+        "completed_with_warnings"
+        if partial_file_count or failed_file_count
+        else "completed"
+    )
     summary = {
         "dataset_config": dataclass_to_jsonable(config),
         "document_count": document_count,
@@ -394,6 +428,8 @@ def build_dataset(
                                        config.conversation_dataset_paths],
         "instruction_dataset_paths": [str(path) for path in
                                       config.instruction_dataset_paths],
+        "tool_call_dataset_paths": [str(path) for path in
+                                    config.tool_call_dataset_paths],
         "default_data_paths": [str(path) for path in
                                config.default_data_paths],
         "mixture_weights": config.mixture_weights,
@@ -412,8 +448,11 @@ def build_dataset(
         "source_files_truncated": stats.source_files_truncated,
         "cached_file_count": cached_file_count,
         "processed_file_count": processed_file_count,
+        "partial_file_count": partial_file_count,
         "skipped_file_count": skipped_file_count,
         "failed_file_count": failed_file_count,
+        "invalid_record_count": invalid_record_count,
+        "preparation_outcome": preparation_outcome,
         "source_file_count": manifest.count(),
         "prepare_mode": config.prepare_mode,
         "tokenizer_strategy": config.tokenizer_strategy,
@@ -435,45 +474,67 @@ def build_dataset(
             "most_repeated_block_count"],
         "top_repeated_blocks": duplicate_report["top_repeated_blocks"],
     }
+    manifest.set_meta(
+        "preparation_outcome",
+        preparation_outcome,
+        commit=False,
+    )
+    manifest.set_meta(
+        "invalid_record_count",
+        invalid_record_count,
+        commit=False,
+    )
+    manifest.commit()
     dataset_version = record_dataset_version(config.output_dir, summary,
                                              manifest)
     write_json(config.output_dir / "dataset_summary.json", summary)
     manifest.close()
     _emit(progress,
           f"Dataset version recorded: {dataset_version['version_id']}.", 98)
-    _emit(progress, f"Dataset ready: {config.output_dir}", 100)
+    _emit(
+        progress,
+        f"Dataset ready: {config.output_dir}",
+        100,
+        event_type="completion",
+        outcome=preparation_outcome,
+        partial_file_count=partial_file_count,
+        failed_file_count=failed_file_count,
+        invalid_record_count=invalid_record_count,
+    )
     return DatasetBuildResult(
-        config.output_dir,
-        tokenizer_path,
-        document_count,
-        token_count,
-        tokenizer.get_vocab_size(),
-        character_count,
-        suggested_vocab_size,
-        train_window_count,
-        val_window_count,
-        sequence_stats,
-        warning,
-        code_sample_count,
-        prose_sample_count,
-        conversation_sample_count,
-        cached_file_count,
-        processed_file_count,
-        skipped_file_count,
-        failed_file_count,
-        str(dataset_version["version_id"]),
-        int(dataset_version["version_number"]),
-        mixture_report,
-        float(quality_report["score"]),
-        float(quality_report["stars"]),
-        str(quality_report["label"]),
-        list(quality_report["reasons"]),
-        int(duplicate_report["duplicate_block_count"]),
-        int(duplicate_report["unique_block_count"]),
-        int(duplicate_report["block_count"]),
-        float(duplicate_report["duplicate_block_ratio"]),
-        float(duplicate_report["unique_block_ratio"]),
+        output_dir=config.output_dir,
+        tokenizer_path=tokenizer_path,
+        document_count=document_count,
+        token_count=token_count,
+        vocab_size=tokenizer.get_vocab_size(),
+        character_count=character_count,
+        suggested_vocab_size=suggested_vocab_size,
+        train_window_count=train_window_count,
+        val_window_count=val_window_count,
+        sequence_token_stats=sequence_stats,
+        warning=warning,
+        code_sample_count=code_sample_count,
+        prose_sample_count=prose_sample_count,
+        conversation_sample_count=conversation_sample_count,
+        cached_file_count=cached_file_count,
+        processed_file_count=processed_file_count,
+        partial_file_count=partial_file_count,
+        skipped_file_count=skipped_file_count,
+        failed_file_count=failed_file_count,
+        invalid_record_count=invalid_record_count,
+        preparation_outcome=preparation_outcome,
+        dataset_version_id=str(dataset_version["version_id"]),
+        dataset_version_number=int(dataset_version["version_number"]),
+        mixture_report=mixture_report,
+        quality_score=float(quality_report["score"]),
+        quality_stars=float(quality_report["stars"]),
+        quality_label=str(quality_report["label"]),
+        quality_reasons=list(quality_report["reasons"]),
+        duplicate_block_count=int(duplicate_report["duplicate_block_count"]),
+        unique_block_count=int(duplicate_report["unique_block_count"]),
+        corpus_block_count=int(duplicate_report["block_count"]),
+        duplicate_block_ratio=float(duplicate_report["duplicate_block_ratio"]),
+        unique_block_ratio=float(duplicate_report["unique_block_ratio"]),
     )
 
 __all__ = ["DatasetBuildResult", "build_dataset", "estimate_vocab_size", "content_warning"]
-

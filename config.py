@@ -30,13 +30,14 @@ class DatasetConfig:
         prepare_mode: Dataset update mode: incremental, full_rebuild, or force_reprocess.
         tokenizer_strategy: Tokenizer policy: auto, train_new, reuse_dataset, or import_tokenizer.
         tokenizer_path: Optional existing tokenizer JSON used by import_tokenizer.
-        dataset_stage: Intended dataset purpose: base, instruction, conversation, or code.
+        dataset_stage: Intended dataset purpose: base, instruction, conversation, code, or tool_call.
         conversation_datasets: Built-in Hugging Face conversation dataset IDs to include.
         conversation_sample_limit: Maximum rows to read from each selected conversation dataset. Zero means no limit.
         conversation_dataset_path: Optional local JSON/JSONL file or folder containing conversation samples.
         instruction_dataset_path: Optional local JSON/JSONL file or folder containing instruction samples.
         conversation_dataset_paths: Local JSON/JSONL files or folders containing conversation samples.
         instruction_dataset_paths: Local JSON/JSONL files or folders containing instruction samples.
+        tool_call_dataset_paths: Local JSON/JSONL files or folders containing OpenAI-style tool-call samples.
         default_data_paths: Bundled starter data files selected from the Dataset Blueprint panel.
         mixture_weights: Planned dataset mixture percentages by source family.
         fast_scan_mode: Uses sampled fingerprints for faster large-corpus scans.
@@ -76,6 +77,7 @@ class DatasetConfig:
     instruction_dataset_path: Optional[Path] = None
     conversation_dataset_paths: list[Path] = field(default_factory=list)
     instruction_dataset_paths: list[Path] = field(default_factory=list)
+    tool_call_dataset_paths: list[Path] = field(default_factory=list)
     default_data_paths: list[Path] = field(default_factory=list)
     mixture_weights: dict[str, float] = field(default_factory=dict)
     fast_scan_mode: bool = False
@@ -209,6 +211,9 @@ class TrainingConfig:
         require_compatible_resume: Validate tokenizer/model compatibility before resuming.
         early_stopping: Stop training when validation loss stops improving.
         early_stopping_patience: Consecutive evaluations without improvement before stopping.
+        telemetry_interval_seconds: Minimum wall-clock interval between lightweight metric samples.
+        stability_metrics_interval_seconds: Minimum interval between expensive norm metrics.
+        preview_interval_seconds: Minimum interval between decoded sample previews.
     """
 
     output_dir: Path
@@ -245,6 +250,9 @@ class TrainingConfig:
     require_compatible_resume: bool = True
     early_stopping: bool = True
     early_stopping_patience: int = 3
+    telemetry_interval_seconds: float = 1.0
+    stability_metrics_interval_seconds: float = 15.0
+    preview_interval_seconds: float = 30.0
 
     def validate(self) -> None:
         """Validate optimizer and schedule settings.
@@ -280,6 +288,12 @@ class TrainingConfig:
             raise ValueError("polynomial_power must be greater than 0")
         if self.sample_stride <= 0:
             raise ValueError("sample_stride must be greater than 0")
+        if self.telemetry_interval_seconds < 0.0:
+            raise ValueError("telemetry_interval_seconds cannot be negative")
+        if self.stability_metrics_interval_seconds < 0.0:
+            raise ValueError("stability_metrics_interval_seconds cannot be negative")
+        if self.preview_interval_seconds < 0.0:
+            raise ValueError("preview_interval_seconds cannot be negative")
 
 
 def dataclass_to_jsonable(value: Any) -> dict[str, Any]:
