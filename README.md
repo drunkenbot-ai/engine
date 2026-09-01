@@ -2,6 +2,25 @@
 
 The core API of drunkenBot IDE.
 
+## Structured dataset preparation
+
+Malformed or schema-invalid JSON/JSONL records are grouped into one bounded
+diagnostic per source file. Each manifest entry uses `record_diagnostics` with
+the complete `invalid_record_count`, at most 12 compressed `location_ranges`,
+an `omitted_location_count`, bounded `reason_counts`, and a human-readable
+`summary`. Valid JSONL rows remain independent documents.
+
+`DatasetBuildResult` and `dataset_summary.json` expose `partial_file_count`,
+`failed_file_count`, `invalid_record_count`, and `preparation_outcome`.
+Each affected source emits one bounded `event_type="dataset_diagnostic"` event
+with `level`, per-source `outcome`, `source_path`, and the compact `diagnostic`
+object.
+Preparation emits exactly one terminal progress event with
+`event_type="completion"` and `outcome="completed"` or
+`"completed_with_warnings"`; the event repeats the partial, failed, and invalid
+counts for UI consumers. A file is partial only when it produced usable data
+alongside invalid records. Files with no usable records are failed.
+
 ## Standalone local training worker
 
 Local training can run outside the desktop process, with no Qt dependency. Create

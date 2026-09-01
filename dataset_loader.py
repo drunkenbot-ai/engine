@@ -11,9 +11,11 @@ from .data import (
     Document,
     SUPPORTED_CODE_SUFFIXES,
     SUPPORTED_TEXT_SUFFIXES,
+    JsonRecordDiagnostics,
     document_from_dict,
     file_fingerprint,
     load_structured_json_documents_with_diagnostics,
+    structured_json_source_files,
     supported_source_paths,
 )
 from .document_extraction import bad_extraction_reasons as _bad_extraction_reasons, extract_documents_worker
@@ -27,7 +29,7 @@ def _load_documents_with_cache(
         corpus_builder: "_StreamingCorpusBuilder",
         progress: Optional[Callable[[Any], None]],
         should_stop: Optional[Callable[[], bool]],
-) -> tuple[Any, int, int, int, int]:
+) -> tuple[Any, int, int, int, int, int, int]:
     """Load documents using an extraction cache and stream them into the corpus.
 
     New (non-cached) files are extracted in parallel worker processes (see
@@ -45,7 +47,8 @@ def _load_documents_with_cache(
         should_stop: Optional cancellation callback.
 
     Returns:
-        Manifest, cached, processed, skipped, and failed file counts.
+        Manifest plus cached, processed, partial, skipped, failed, and invalid
+        record counts.
     """
 
     manifest_db_path = config.output_dir / "dataset_manifest.sqlite3"
@@ -54,10 +57,16 @@ def _load_documents_with_cache(
     cache_dir.mkdir(parents=True, exist_ok=True)
     manifest = ManifestStore.open(manifest_db_path,
                                   legacy_json_path=legacy_manifest_path)
+    manifest.start_file_tracking()
     key = _cache_key(config)
     force_reprocess = config.prepare_mode == "force_reprocess"
 
     local_structured_paths = _local_structured_dataset_paths(config)
+    configured_structured_files = {
+        source.resolve()
+        for local_path, _kind, _label in local_structured_paths
+        for source in structured_json_source_files(Path(local_path))
+    }
     selected_default_files = [
         Path(path)
         for path in config.default_data_paths
@@ -107,13 +116,120 @@ def _load_documents_with_cache(
         _emit(progress,
               f"Bundled starter data enabled: {len(default_paths)} file(s).",
               8)
+    source_paths = [
+        path
+        for path in source_paths
+        if path.resolve() not in configured_structured_files
+    ]
     _emit(progress,
           f"Found {len(source_paths)} supported files in {config.input_dir}.",
           8)
     cached_count = 0
     processed_count = 0
+    partial_count = 0
     skipped_count = 0
     failed_count = 0
+    invalid_record_count = 0
+
+    def _read_diagnostics(
+        path: Path,
+        payload: dict[str, Any],
+    ) -> tuple[list[JsonRecordDiagnostics], bool, bool]:
+        values = payload.get("record_diagnostics")
+        if values:
+            if isinstance(values, dict):
+                values = [values]
+            if not isinstance(values, list) or not all(
+                isinstance(value, dict) for value in values
+            ):
+                return [], False, False
+            try:
+                diagnostics = [
+                    JsonRecordDiagnostics.from_jsonable(value, path)
+                    for value in values
+                ]
+            except (TypeError, ValueError, KeyError):
+                return [], False, False
+            if any(
+                diagnostic.invalid_record_count <= 0
+                for diagnostic in diagnostics
+            ):
+                return [], False, False
+            return diagnostics, False, True
+        legacy_value = payload.get("record_errors")
+        if legacy_value is not None and not isinstance(legacy_value, list):
+            return [], False, False
+        legacy_messages = list(legacy_value or [])
+        if not legacy_messages:
+            return [], False, True
+        return [
+            JsonRecordDiagnostics.from_legacy_messages(path, legacy_messages)
+        ], True, True
+
+    def _diagnostics_payload(
+        diagnostics: list[JsonRecordDiagnostics],
+    ) -> list[dict[str, Any]]:
+        return [diagnostic.to_jsonable() for diagnostic in diagnostics]
+
+    def _upsert_manifest(
+        manifest_key: str,
+        entry: dict[str, Any],
+    ) -> None:
+        manifest.track_file(manifest_key)
+        manifest.upsert(manifest_key, entry, commit=False)
+
+    def _load_cached_payload(
+        cache_path: Path,
+        source_path: Path,
+    ) -> Optional[
+        tuple[
+            list[dict[str, Any]],
+            list[Document],
+            list[JsonRecordDiagnostics],
+            bool,
+        ]
+    ]:
+        try:
+            cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if isinstance(cached_payload, dict):
+            cached_items_value = cached_payload.get("documents")
+            if not isinstance(cached_items_value, list):
+                return None
+            cached_items = cached_items_value
+            (
+                cached_diagnostics,
+                migrated_legacy_diagnostics,
+                diagnostics_valid,
+            ) = _read_diagnostics(source_path, cached_payload)
+            if not diagnostics_valid:
+                return None
+        elif isinstance(cached_payload, list):
+            if source_path.suffix.lower() == ".jsonl":
+                return None
+            cached_items = cached_payload
+            cached_diagnostics = []
+            migrated_legacy_diagnostics = False
+        else:
+            return None
+        if not cached_items or not all(
+            isinstance(item, dict) for item in cached_items
+        ):
+            return None
+        try:
+            cached_documents = [
+                document_from_dict(item)
+                for item in cached_items
+            ]
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        return (
+            cached_items,
+            cached_documents,
+            cached_diagnostics,
+            migrated_legacy_diagnostics,
+        )
 
     def _submit_cached(cached_documents: list[Document]) -> None:
         for document in cached_documents:
@@ -146,20 +262,20 @@ def _load_documents_with_cache(
             pending_extraction.append(path)
             continue
 
-        cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        if isinstance(cached_payload, dict):
-            cached_items = list(cached_payload.get("documents") or [])
-            cached_record_errors = [
-                str(error)
-                for error in cached_payload.get("record_errors") or []
-            ]
-        else:
-            cached_items = list(cached_payload)
-            cached_record_errors = []
-        cached_documents = [
-            document_from_dict(item)
-            for item in cached_items
-        ]
+        cache_result = _load_cached_payload(cache_path, path)
+        if cache_result is None:
+            pending_extraction.append(path)
+            _emit(
+                progress,
+                f"Reprocessing {path.name}: extraction cache is invalid.",
+            )
+            continue
+        (
+            cached_items,
+            cached_documents,
+            cached_diagnostics,
+            migrated_legacy_diagnostics,
+        ) = cache_result
         cached_extraction_reasons = []
         if path.suffix.lower() == ".pdf":
             cached_text = "\n".join(document.text for document in cached_documents)
@@ -178,36 +294,60 @@ def _load_documents_with_cache(
             skipped_count += 1
             reason_text = "; ".join(cached_extraction_reasons)
             _emit(progress, f"Skipped cached {path.name}: suspicious PDF extraction ({reason_text}).")
-            manifest.upsert(
+            _upsert_manifest(
                 manifest_key,
                 {
                     "path": str(path), "sha256": digest, "size": stat.st_size,
                     "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                     "status": "skipped_bad_extraction", "reasons": cached_extraction_reasons,
                 },
-                commit=False,
             )
             continue
         _submit_cached(cached_documents)
+        cached_document_count = len(cached_documents)
         del cached_documents
-        cached_count += 1
-        if cached_record_errors:
-            failed_count += 1
-            for error in cached_record_errors:
-                _emit(progress, f"Invalid record: {error}")
-        manifest.upsert(
+        diagnostic_payload = _diagnostics_payload(cached_diagnostics)
+        diagnostic_count = sum(
+            item.invalid_record_count for item in cached_diagnostics
+        )
+        invalid_record_count += diagnostic_count
+        if cached_diagnostics:
+            partial_count += 1
+            _emit(
+                progress,
+                f"{cached_diagnostics[0].summary()} Preserved "
+                f"{cached_document_count:,} valid sample(s) from cache.",
+                event_type="dataset_diagnostic",
+                level="warning",
+                outcome="partial",
+                source_path=str(path),
+                diagnostic=diagnostic_payload[0],
+            )
+        else:
+            cached_count += 1
+            _emit(progress, f"Reused {path.name} from cache.")
+        if migrated_legacy_diagnostics:
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "documents": cached_items,
+                        "record_diagnostics": diagnostic_payload,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        _upsert_manifest(
             manifest_key,
             {
                 "path": str(path), "sha256": digest, "size": stat.st_size,
                 "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                 "cache_file": str(cache_path.relative_to(config.output_dir)),
-                "status": "cached_partial" if cached_record_errors else "cached",
-                "record_error_count": len(cached_record_errors),
-                "record_errors": cached_record_errors,
+                "status": "cached_partial" if cached_diagnostics else "cached",
+                "invalid_record_count": diagnostic_count,
+                "record_diagnostics": diagnostic_payload,
             },
-            commit=False,
         )
-        _emit(progress, f"Reused {path.name} from cache.")
 
     # Second pass: extract new/changed files in parallel worker processes.
     # ``max_workers`` bounds how many files' full text can be resident (one
@@ -274,28 +414,26 @@ def _load_documents_with_cache(
                 except Exception as exc:  # noqa: BLE001 - reported to the user
                     failed_count += 1
                     _emit(progress, f"Failed {path.name}: {exc}", percent)
-                    manifest.upsert(
+                    _upsert_manifest(
                         manifest_key,
                         {
                             "path": str(path), "sha256": digest, "size": stat.st_size,
                             "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                             "status": "failed", "error": str(exc),
                         },
-                        commit=False,
                     )
                     continue
 
                 if result["error"] is not None:
                     failed_count += 1
                     _emit(progress, f"Failed {path.name}: {result['error']}", percent)
-                    manifest.upsert(
+                    _upsert_manifest(
                         manifest_key,
                         {
                             "path": str(path), "sha256": digest, "size": stat.st_size,
                             "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                             "status": "failed", "error": result["error"],
                         },
-                        commit=False,
                     )
                     continue
 
@@ -303,56 +441,62 @@ def _load_documents_with_cache(
                     skipped_count += 1
                     reason_text = "; ".join(result["bad_extraction_reasons"])
                     _emit(progress, f"Skipped {path.name}: suspicious PDF extraction ({reason_text}).", percent)
-                    manifest.upsert(
+                    _upsert_manifest(
                         manifest_key,
                         {
                             "path": str(path), "sha256": digest, "size": stat.st_size,
                             "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                             "status": "skipped_bad_extraction", "reasons": result["bad_extraction_reasons"],
                         },
-                        commit=False,
                     )
                     continue
 
-                record_errors = [
-                    str(error)
-                    for error in result.get("record_errors") or []
+                record_diagnostics = [
+                    JsonRecordDiagnostics.from_jsonable(value, path)
+                    for value in result.get("record_diagnostics") or []
+                    if isinstance(value, dict)
                 ]
-                for error in record_errors:
-                    _emit(progress, f"Invalid record: {error}", percent)
+                diagnostic_payload = _diagnostics_payload(record_diagnostics)
+                diagnostic_count = sum(
+                    item.invalid_record_count for item in record_diagnostics
+                )
+                invalid_record_count += diagnostic_count
 
                 if not result["documents"]:
-                    if record_errors:
+                    if record_diagnostics:
                         failed_count += 1
                         _emit(
                             progress,
-                            f"Failed {path.name}: no valid records; "
-                            f"{len(record_errors)} invalid record(s).",
+                            f"Failed {record_diagnostics[0].summary()} "
+                            "No valid records remain.",
                             percent,
+                            event_type="dataset_diagnostic",
+                            level="error",
+                            outcome="failed",
+                            source_path=str(path),
+                            diagnostic=diagnostic_payload[0],
                         )
-                        manifest.upsert(
+                        _upsert_manifest(
                             manifest_key,
                             {
                                 "path": str(path), "sha256": digest,
                                 "size": stat.st_size,
                                 "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                                 "status": "failed_invalid_records",
-                                "record_error_count": len(record_errors),
-                                "record_errors": record_errors,
+                                "invalid_record_count": diagnostic_count,
+                                "record_diagnostics": diagnostic_payload,
                             },
-                            commit=False,
                         )
                         continue
                     skipped_count += 1
                     _emit(progress, f"Skipped {path.name}: no readable text found.", percent)
-                    manifest.upsert(
+                    _upsert_manifest(
                         manifest_key,
                         {
                             "path": str(path), "sha256": digest, "size": stat.st_size,
                             "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                             "status": "skipped_empty",
                         },
-                        commit=False,
                     )
                     continue
 
@@ -360,7 +504,7 @@ def _load_documents_with_cache(
                     json.dumps(
                         {
                             "documents": result["documents"],
-                            "record_errors": record_errors,
+                            "record_diagnostics": diagnostic_payload,
                         },
                         ensure_ascii=False,
                     ),
@@ -368,79 +512,135 @@ def _load_documents_with_cache(
                 )
                 for item in result["documents"]:
                     corpus_builder.submit(document_from_dict(item))
-                processed_count += 1
-                if record_errors:
-                    failed_count += 1
+                if record_diagnostics:
+                    partial_count += 1
                     _emit(
                         progress,
-                        f"Partially processed {path.name}: "
-                        f"{len(result['documents'])} valid sample(s), "
-                        f"{len(record_errors)} invalid record(s).",
+                        f"{record_diagnostics[0].summary()} Preserved "
+                        f"{len(result['documents']):,} valid sample(s).",
                         percent,
+                        event_type="dataset_diagnostic",
+                        level="warning",
+                        outcome="partial",
+                        source_path=str(path),
+                        diagnostic=diagnostic_payload[0],
                     )
                 else:
+                    processed_count += 1
                     _emit(progress, f"Processed {path.name}: {len(result['documents'])} sample(s).", percent)
-                manifest.upsert(
+                _upsert_manifest(
                     manifest_key,
                     {
                         "path": str(path), "sha256": digest, "size": stat.st_size,
                         "mtime_ns": stat.st_mtime_ns, "cache_key": key,
                         "cache_file": str(cache_path.relative_to(config.output_dir)),
-                        "status": "partial" if record_errors else "processed",
-                        "record_error_count": len(record_errors),
-                        "record_errors": record_errors,
+                        "status": "partial" if record_diagnostics else "processed",
+                        "invalid_record_count": diagnostic_count,
+                        "record_diagnostics": diagnostic_payload,
                     },
-                    commit=False,
                 )
 
     for local_path, kind, label in local_structured_paths:
         if should_stop and should_stop():
             raise RuntimeError("Dataset preparation stopped by user.")
         local_path = Path(local_path)
+        local_root = str(local_path.resolve())
         _emit(progress, f"Loading {label} JSON/JSONL dataset: {local_path}",
               42)
         local_result = load_structured_json_documents_with_diagnostics(
             local_path,
             kind=kind,
             lowercase=config.lowercase,
-            on_invalid=lambda message: _emit(progress, f"Invalid record: {message}", 42),
+            on_invalid=lambda _message: None,
         )
         for document in local_result.documents:
             corpus_builder.submit(document)
         local_document_count = len(local_result.documents)
-        invalid_files = {issue.path.resolve() for issue in local_result.issues}
+        invalid_files = {
+            diagnostic.path.resolve()
+            for diagnostic in local_result.diagnostics
+        }
         document_files = {
             Path(str(document.path).rsplit("#", 1)[0]).resolve()
             for document in local_result.documents
         }
-        processed_count += len(document_files)
-        failed_count += len(invalid_files)
-        issue_messages = [issue.message() for issue in local_result.issues]
-        status = (
-            "partial"
-            if local_document_count and issue_messages
-            else "failed_invalid_records"
-            if issue_messages
-            else "processed"
+        partial_files = invalid_files & document_files
+        failed_files = invalid_files - document_files
+        clean_files = {
+            path.resolve() for path in local_result.source_files
+        } - invalid_files
+        processed_count += len(clean_files)
+        partial_count += len(partial_files)
+        failed_count += len(failed_files)
+        local_invalid_count = sum(
+            diagnostic.invalid_record_count
+            for diagnostic in local_result.diagnostics
         )
-        manifest_key = f"local-{kind}://{local_path.resolve()}"
-        manifest.upsert(
-            manifest_key,
-            {
-                "path": str(local_path),
-                "kind": kind,
-                "sample_count": local_document_count,
-                "cache_key": key,
-                "status": status,
-                "record_error_count": len(issue_messages),
-                "record_errors": issue_messages,
-            },
-            commit=False,
-        )
+        invalid_record_count += local_invalid_count
+        diagnostics_by_file = {
+            diagnostic.path.resolve(): diagnostic
+            for diagnostic in local_result.diagnostics
+        }
+        documents_by_file: dict[Path, int] = {}
+        for document in local_result.documents:
+            document_path = Path(str(document.path).rsplit("#", 1)[0]).resolve()
+            documents_by_file[document_path] = (
+                documents_by_file.get(document_path, 0) + 1
+            )
+        for diagnostic in local_result.diagnostics:
+            valid_count = documents_by_file.get(diagnostic.path.resolve(), 0)
+            suffix = (
+                f" Preserved {valid_count:,} valid sample(s)."
+                if valid_count
+                else " No valid records remain."
+            )
+            diagnostic_outcome = "partial" if valid_count else "failed"
+            _emit(
+                progress,
+                diagnostic.summary() + suffix,
+                42,
+                event_type="dataset_diagnostic",
+                level="warning" if valid_count else "error",
+                outcome=diagnostic_outcome,
+                source_path=str(diagnostic.path),
+                diagnostic=diagnostic.to_jsonable(),
+            )
+        for source_file in local_result.source_files:
+            resolved_source = source_file.resolve()
+            diagnostic = diagnostics_by_file.get(resolved_source)
+            valid_count = documents_by_file.get(resolved_source, 0)
+            status = (
+                "partial"
+                if diagnostic is not None and valid_count
+                else "failed_invalid_records"
+                if diagnostic is not None
+                else "processed"
+            )
+            _upsert_manifest(
+                f"local-{kind}://{resolved_source}",
+                {
+                    "path": str(source_file),
+                    "local_dataset_root": local_root,
+                    "kind": kind,
+                    "sample_count": valid_count,
+                    "cache_key": key,
+                    "status": status,
+                    "invalid_record_count": (
+                        diagnostic.invalid_record_count
+                        if diagnostic is not None
+                        else 0
+                    ),
+                    "record_diagnostics": (
+                        [diagnostic.to_jsonable()]
+                        if diagnostic is not None
+                        else []
+                    ),
+                },
+            )
         _emit(
             progress,
             f"Loaded {local_document_count:,} valid {kind} sample(s) from "
-            f"{local_path.name}; {len(issue_messages):,} invalid record(s).",
+            f"{local_path.name}; {local_invalid_count:,} invalid record(s).",
             43,
         )
 
@@ -467,13 +667,16 @@ def _load_documents_with_cache(
             manifest.set_meta("dataset_config", dataclass_to_jsonable(config),
                               commit=False)
             manifest.set_meta("cache_key", key, commit=False)
+            manifest.prune_untracked_files()
             manifest.commit()
             return (
                 manifest,
                 cached_count,
                 processed_count,
+                partial_count,
                 skipped_count,
                 failed_count,
+                invalid_record_count,
             )
         hf_cache_dir = config.output_dir / "cache" / "huggingface"
         labels = [
@@ -499,7 +702,7 @@ def _load_documents_with_cache(
         config.conversation_datasets = selected_dataset_ids
         for dataset_id in selected_dataset_ids:
             preset = CONVERSATION_DATASET_PRESETS.get(dataset_id)
-            manifest.upsert(
+            _upsert_manifest(
                 f"hf://{dataset_id}",
                 {
                     "path": f"hf://{dataset_id}",
@@ -510,18 +713,20 @@ def _load_documents_with_cache(
                     "cache_key": key,
                     "status": "processed",
                 },
-                commit=False,
             )
         processed_count += len(selected_dataset_ids)
 
     manifest.set_meta("dataset_config", dataclass_to_jsonable(config),
                       commit=False)
     manifest.set_meta("cache_key", key, commit=False)
+    manifest.prune_untracked_files()
     manifest.commit()
     return (
         manifest,
         cached_count,
         processed_count,
+        partial_count,
         skipped_count,
         failed_count,
+        invalid_record_count,
     )

@@ -20,7 +20,7 @@ from .data import (
     Document,
     document_to_dict,
     expand_code_documents,
-    load_jsonl_documents,
+    load_jsonl_documents_with_diagnostics,
     read_supported_document,
 )
 
@@ -103,17 +103,22 @@ def extract_documents_worker(
 
     try:
         if path.suffix.lower() == ".jsonl":
-            record_errors: list[str] = []
-            source_documents = load_jsonl_documents(
+            load_result = load_jsonl_documents_with_diagnostics(
                 path,
                 lowercase=lowercase,
-                on_invalid=record_errors.append,
+                on_invalid=lambda _message: None,
             )
             return {
                 "path": str(path),
-                "documents": [document_to_dict(doc) for doc in source_documents],
+                "documents": [
+                    document_to_dict(doc)
+                    for doc in load_result.documents
+                ],
                 "error": None,
-                "record_errors": record_errors,
+                "record_diagnostics": [
+                    diagnostic.to_jsonable()
+                    for diagnostic in load_result.diagnostics
+                ],
                 "bad_extraction_reasons": [],
             }
         source_doc = read_supported_document(
@@ -127,7 +132,7 @@ def extract_documents_worker(
             "path": str(path),
             "documents": [],
             "error": str(exc),
-            "record_errors": [],
+            "record_diagnostics": [],
             "bad_extraction_reasons": [],
         }
 
@@ -136,7 +141,7 @@ def extract_documents_worker(
             "path": str(path),
             "documents": [],
             "error": None,
-            "record_errors": [],
+            "record_diagnostics": [],
             "bad_extraction_reasons": [],
         }
 
@@ -156,7 +161,7 @@ def extract_documents_worker(
             "path": str(path),
             "documents": [],
             "error": None,
-            "record_errors": [],
+            "record_diagnostics": [],
             "bad_extraction_reasons": reasons,
         }
 
@@ -173,7 +178,7 @@ def extract_documents_worker(
         "path": str(path),
         "documents": [document_to_dict(doc) for doc in source_documents],
         "error": None,
-        "record_errors": [],
+        "record_diagnostics": [],
         "bad_extraction_reasons": [],
     }
 

@@ -45,8 +45,12 @@ def _local_structured_dataset_paths(config: DatasetConfig) -> list[
             seen.add(key)
             items.append((Path(path), "tool_call", "local tool-call"))
     return items
-def _emit(progress: Optional[Callable[[Any], None]], message: str,
-          percent: Optional[int] = None) -> None:
+def _emit(
+    progress: Optional[Callable[[Any], None]],
+    message: str,
+    percent: Optional[int] = None,
+    **metadata: Any,
+) -> None:
     """Emit a progress event if a callback is available.
 
     Args:
@@ -57,7 +61,7 @@ def _emit(progress: Optional[Callable[[Any], None]], message: str,
 
     LOGGER.info(message)
     if progress:
-        progress({"message": message, "percent": percent})
+        progress({"message": message, "percent": percent, **metadata})
 def _cache_key(config: DatasetConfig) -> str:
     """Return a cache key for extraction-affecting options.
 
