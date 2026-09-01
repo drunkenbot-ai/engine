@@ -17,6 +17,8 @@ from engine.telemetry_store import event_rows_after, metric_rows_after
 from engine.training import TrainingResult
 from engine.training_worker import run_worker_request
 from engine.training_worker_protocol import (
+    ActiveRunError,
+    RunClaim,
     StandaloneTrainingRequest,
     create_worker_request,
     load_run_manifest,
@@ -99,8 +101,14 @@ def test_worker_completes_with_heartbeat_and_persisted_telemetry(
 
     def fake_run(_job, progress, _should_stop):
         initial = load_run_manifest(request.manifest_path)
-        time.sleep(0.25)
-        later = load_run_manifest(request.manifest_path)
+        deadline = time.monotonic() + 2.0
+        later = initial
+        while (
+            later["heartbeat_at"] == initial["heartbeat_at"]
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+            later = load_run_manifest(request.manifest_path)
         observed["status"] = initial["status"]
         observed["heartbeat_changed"] = (
             initial["heartbeat_at"] != later["heartbeat_at"]
@@ -224,6 +232,129 @@ def test_concurrent_launch_is_rejected_without_overwriting_active_run(
 
     assert first_result == [0]
     assert load_run_manifest(request.manifest_path)["status"] == "completed"
+
+
+def test_run_claim_normal_acquisition_is_exclusive(tmp_path: Path) -> None:
+    output_dir = tmp_path / "output"
+    first = RunClaim(output_dir, "run-first")
+    second = RunClaim(output_dir, "run-second")
+
+    first.acquire()
+    with pytest.raises(ActiveRunError, match="active run run-first"):
+        second.acquire()
+    assert protocol_module._load_json(first.path)["run_id"] == "run-first"
+
+    first.release()
+    second.acquire()
+    assert protocol_module._load_json(second.path)["run_id"] == "run-second"
+    second.release()
+
+
+def test_stale_cleanup_serializes_competing_replacement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    stale = RunClaim(output_dir, "run-stale")
+    protocol_module.atomic_write_json(
+        stale.path,
+        {
+            "schema": protocol_module.CLAIM_SCHEMA,
+            "version": protocol_module.PROTOCOL_VERSION,
+            "run_id": "run-stale",
+            "pid": 999_999_999,
+            "process_identity": {
+                "kind": "psutil-create-time",
+                "value": "0.000000",
+            },
+            "created_at": protocol_module.utc_now(),
+        },
+    )
+    recovery = RunClaim(output_dir, "run-recovery")
+    contender = RunClaim(output_dir, "run-contender")
+    stale_inspected = threading.Event()
+    allow_cleanup = threading.Event()
+    contender_started = threading.Event()
+    contender_finished = threading.Event()
+    errors: list[Exception] = []
+    original_read = recovery._read_existing_claim
+
+    def pause_after_stale_read():
+        value = original_read()
+        stale_inspected.set()
+        assert allow_cleanup.wait(2.0)
+        return value
+
+    monkeypatch.setattr(recovery, "_read_existing_claim", pause_after_stale_read)
+
+    recovery_thread = threading.Thread(target=recovery.acquire)
+    recovery_thread.start()
+    assert stale_inspected.wait(1.0)
+
+    def acquire_contender() -> None:
+        contender_started.set()
+        try:
+            contender.acquire()
+        except Exception as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            contender_finished.set()
+
+    contender_thread = threading.Thread(target=acquire_contender)
+    contender_thread.start()
+    assert contender_started.wait(1.0)
+    assert not contender_finished.wait(0.1)
+
+    allow_cleanup.set()
+    recovery_thread.join(timeout=2.0)
+    contender_thread.join(timeout=2.0)
+
+    assert not recovery_thread.is_alive()
+    assert not contender_thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ActiveRunError)
+    assert protocol_module._load_json(recovery.path)["run_id"] == "run-recovery"
+    recovery.release()
+
+
+def test_run_claim_fails_closed_when_mutation_lock_is_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    claim = RunClaim(output_dir, "run-existing")
+    protocol_module.atomic_write_json(
+        claim.path,
+        {
+            "schema": protocol_module.CLAIM_SCHEMA,
+            "version": protocol_module.PROTOCOL_VERSION,
+            "run_id": "run-existing",
+            "pid": 999_999_999,
+            "process_identity": {
+                "kind": "psutil-create-time",
+                "value": "0.000000",
+            },
+            "created_at": protocol_module.utc_now(),
+        },
+    )
+    monkeypatch.setattr(protocol_module, "CLAIM_MUTEX_ATTEMPTS", 1)
+    monkeypatch.setattr(protocol_module, "CLAIM_MUTEX_RETRY_SECONDS", 0)
+
+    def unsupported_lock(_handle) -> None:
+        raise OSError("unsupported")
+
+    monkeypatch.setattr(
+        protocol_module._ClaimMutationLock,
+        "_lock",
+        staticmethod(unsupported_lock),
+    )
+
+    with pytest.raises(ActiveRunError, match="mutation lock"):
+        RunClaim(output_dir, "run-contender").acquire()
+
+    assert protocol_module._load_json(claim.path)["run_id"] == "run-existing"
 
 
 def test_stale_manifest_detection_uses_heartbeat_and_process_identity(

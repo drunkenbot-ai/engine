@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -10,11 +11,14 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BufferedRandom
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
 from .contracts import TrainingJobSpec
+
+LOGGER = logging.getLogger(__name__)
 
 try:
     import psutil
@@ -52,10 +56,91 @@ CONTROL_SCHEMA = "drunkenbot.training-worker-control"
 CLAIM_SCHEMA = "drunkenbot.training-worker-claim"
 PROTOCOL_VERSION = 1
 TERMINAL_STATUSES = {"completed", "stopped", "failed"}
+CLAIM_MUTEX_ATTEMPTS = 100
+CLAIM_MUTEX_RETRY_SECONDS = 0.05
 
 
 class ActiveRunError(RuntimeError):
     """Raised when an output directory already has a live or completed run claim."""
+
+
+class _ClaimMutationLock:
+    """Serialize claim-file ownership changes with an OS-released file lock."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle: Optional[BufferedRandom] = None
+
+    def __enter__(self) -> "_ClaimMutationLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            handle = self.path.open("a+b")
+        except OSError as exc:
+            raise ActiveRunError(
+                f"Could not open claim mutation lock: {self.path}"
+            ) from exc
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+                os.fsync(handle.fileno())
+            last_error: Optional[OSError] = None
+            for _attempt in range(CLAIM_MUTEX_ATTEMPTS):
+                try:
+                    self._lock(handle)
+                except OSError as exc:
+                    last_error = exc
+                    time.sleep(CLAIM_MUTEX_RETRY_SECONDS)
+                    continue
+                self._handle = handle
+                return self
+        except OSError as exc:
+            handle.close()
+            raise ActiveRunError(
+                f"Could not initialize claim mutation lock: {self.path}"
+            ) from exc
+        except BaseException:
+            handle.close()
+            raise
+        handle.close()
+        raise ActiveRunError(
+            f"Could not acquire claim mutation lock: {self.path}"
+        ) from last_error
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            self._unlock(handle)
+        finally:
+            handle.close()
+
+    @staticmethod
+    def _lock(handle: BufferedRandom) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock(handle: BufferedRandom) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def utc_now() -> str:
@@ -233,6 +318,7 @@ class RunClaim:
 
     def __init__(self, output_dir: Path, run_id: str) -> None:
         self.path = Path(output_dir) / "training_worker.lock"
+        self.mutation_lock_path = Path(output_dir) / "training_worker.lock.mutex"
         self.run_id = run_id
         self.pid = os.getpid()
         self.identity = process_identity(self.pid)
@@ -248,18 +334,15 @@ class RunClaim:
             "process_identity": self.identity,
             "created_at": utc_now(),
         }
-        for attempt in range(20):
+        with _ClaimMutationLock(self.mutation_lock_path):
             try:
-                descriptor = os.open(
-                    self.path,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                )
+                descriptor = self._create_claim_file()
             except FileExistsError:
                 existing = self._read_existing_claim()
                 if existing is None:
-                    time.sleep(0.01 * (attempt + 1))
-                    continue
+                    raise ActiveRunError(
+                        f"Unreadable run claim blocks safe launch: {self.path}"
+                    )
                 try:
                     existing_pid = int(existing.get("pid", -1))
                     existing_identity = dict(existing.get("process_identity") or {})
@@ -272,11 +355,13 @@ class RunClaim:
                         f"Output directory already has active run "
                         f"{existing.get('run_id')} (PID {existing.get('pid')})"
                     )
+                self.path.unlink()
                 try:
-                    self.path.unlink()
-                except FileNotFoundError:
-                    pass
-                continue
+                    descriptor = self._create_claim_file()
+                except FileExistsError as exc:
+                    raise ActiveRunError(
+                        f"Run claim changed during stale recovery: {self.path}"
+                    ) from exc
             try:
                 with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
                     json.dump(payload, handle, indent=2, sort_keys=True)
@@ -287,21 +372,36 @@ class RunClaim:
                 self.path.unlink(missing_ok=True)
                 raise
             self._acquired = True
-            return
-        raise ActiveRunError(f"Could not safely inspect existing run claim: {self.path}")
 
     def release(self) -> None:
         if not self._acquired:
             return
-        existing = self._read_existing_claim()
-        if (
-            existing
-            and existing.get("run_id") == self.run_id
-            and existing.get("pid") == self.pid
-            and existing.get("process_identity") == self.identity
-        ):
-            self.path.unlink(missing_ok=True)
-        self._acquired = False
+        try:
+            with _ClaimMutationLock(self.mutation_lock_path):
+                existing = self._read_existing_claim()
+                if (
+                    existing
+                    and existing.get("run_id") == self.run_id
+                    and existing.get("pid") == self.pid
+                    and existing.get("process_identity") == self.identity
+                ):
+                    self.path.unlink(missing_ok=True)
+        except (ActiveRunError, OSError) as exc:
+            LOGGER.warning(
+                "Could not safely release run claim %s; leaving it for stale "
+                "recovery: %s",
+                self.path,
+                exc,
+            )
+        finally:
+            self._acquired = False
+
+    def _create_claim_file(self) -> int:
+        return os.open(
+            self.path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
 
     def _read_existing_claim(self) -> Optional[dict[str, Any]]:
         try:

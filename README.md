@@ -20,6 +20,10 @@ and starts a new process session/process group. The UI may release the returned
 worker with `QThread`. A crash-recoverable `training_worker.lock` claim prevents
 two workers from writing the same output directory; worker exit code `2` means a
 launch was rejected because an active or already-finished run identity exists.
+Claim creation, stale recovery, and release are serialized by an OS-backed
+mutex file whose lock is released automatically if an acquiring process exits;
+if that mutex cannot be acquired, launch fails closed rather than unlinking a
+claim whose ownership transition cannot be proven.
 Each run has its own manifest/control directory, so a prior stop sentinel cannot
 affect a later run.
 
