@@ -175,6 +175,35 @@ class ManifestStore:
             # though the caller hasn't explicitly called commit() yet.
             self.commit()
 
+    def start_file_tracking(self) -> None:
+        """Start a bounded SQLite-backed set of sources seen in this build."""
+
+        self._connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS current_files ("
+            "manifest_key TEXT PRIMARY KEY"
+            ")"
+        )
+        self._connection.execute("DELETE FROM current_files")
+
+    def track_file(self, manifest_key: str) -> None:
+        """Mark one manifest key as current without retaining it in Python."""
+
+        self._connection.execute(
+            "INSERT OR IGNORE INTO current_files (manifest_key) VALUES (?)",
+            (manifest_key,),
+        )
+
+    def prune_untracked_files(self) -> None:
+        """Remove stale rows only after a complete source scan."""
+
+        self._connection.execute(
+            "DELETE FROM files WHERE NOT EXISTS ("
+            "SELECT 1 FROM current_files "
+            "WHERE current_files.manifest_key = files.manifest_key"
+            ")"
+        )
+        self._pending_since_commit += 1
+
     def iter_files(self) -> Iterator[tuple[str, dict[str, Any]]]:
         """Yield every tracked file's ``(manifest_key, entry)`` pair.
 

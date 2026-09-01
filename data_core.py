@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -13,6 +13,9 @@ import PyPDF2
 from .tool_call_data import format_tool_call_record
 
 LOGGER = logging.getLogger(__name__)
+MAX_JSON_LOCATION_RANGES = 12
+MAX_JSON_REASON_TYPES = 4
+MAX_JSON_REASON_LENGTH = 160
 
 
 class OperationCancelled(RuntimeError):
@@ -89,12 +92,186 @@ class JsonRecordIssue:
 
 
 @dataclass
+class JsonRecordDiagnostics:
+    """Bounded per-file accounting for malformed or unusable JSON records."""
+
+    path: Path
+    invalid_record_count: int = 0
+    location_ranges: list[tuple[int, int]] = field(default_factory=list)
+    omitted_location_count: int = 0
+    reason_counts: dict[str, int] = field(default_factory=dict)
+    omitted_reason_count: int = 0
+
+    @property
+    def location_kind(self) -> str:
+        return "line" if self.path.suffix.lower() == ".jsonl" else "record"
+
+    def add(self, record_number: int, reason: str) -> None:
+        """Record one issue without retaining one object or message per row."""
+
+        reason = " ".join(str(reason).split())[:MAX_JSON_REASON_LENGTH]
+        self.invalid_record_count += 1
+        if record_number > 0:
+            if (
+                self.location_ranges
+                and self.location_ranges[-1][1] + 1 == record_number
+            ):
+                start, _end = self.location_ranges[-1]
+                self.location_ranges[-1] = (start, record_number)
+            elif len(self.location_ranges) < MAX_JSON_LOCATION_RANGES:
+                self.location_ranges.append((record_number, record_number))
+            else:
+                self.omitted_location_count += 1
+        else:
+            self.omitted_location_count += 1
+
+        if reason in self.reason_counts:
+            self.reason_counts[reason] += 1
+        elif len(self.reason_counts) < MAX_JSON_REASON_TYPES:
+            self.reason_counts[reason] = 1
+        else:
+            self.omitted_reason_count += 1
+
+    def summary(self) -> str:
+        """Return one bounded human-readable diagnostic sentence."""
+
+        count = self.invalid_record_count
+        noun = "record" if count == 1 else "records"
+        locations = self._location_summary()
+        reasons = ", ".join(
+            f"{reason} ({reason_count:,})"
+            for reason, reason_count in self.reason_counts.items()
+        )
+        if self.omitted_reason_count:
+            reasons += (
+                f", {self.omitted_reason_count:,} more issue"
+                f"{'s' if self.omitted_reason_count != 1 else ''}"
+            )
+        return (
+            f"{self.path.name}: {count:,} invalid {noun}"
+            f"{f' at {locations}' if locations else ''}; reasons: {reasons}."
+        )
+
+    def message(self) -> str:
+        """Compatibility alias for callers of the former issue object."""
+
+        return self.summary()
+
+    def to_jsonable(self) -> dict[str, Any]:
+        """Return compact complete counts plus bounded location/reason previews."""
+
+        return {
+            "path": str(self.path),
+            "filename": self.path.name,
+            "location_kind": self.location_kind,
+            "invalid_record_count": self.invalid_record_count,
+            "location_ranges": [
+                {"start": start, "end": end}
+                for start, end in self.location_ranges
+            ],
+            "omitted_location_count": self.omitted_location_count,
+            "reason_counts": dict(self.reason_counts),
+            "omitted_reason_count": self.omitted_reason_count,
+            "summary": self.summary(),
+        }
+
+    @classmethod
+    def from_jsonable(
+        cls,
+        value: dict[str, Any],
+        fallback_path: Optional[Path] = None,
+    ) -> "JsonRecordDiagnostics":
+        """Restore diagnostics from a cache or manifest payload."""
+
+        path = Path(value.get("path") or fallback_path or value.get("filename") or "")
+        diagnostics = cls(path=path)
+        diagnostics.invalid_record_count = int(
+            value.get("invalid_record_count", 0)
+        )
+        ranges = value.get("location_ranges") or []
+        if not isinstance(ranges, list):
+            raise TypeError("location_ranges must be a list")
+        for item in ranges:
+            if len(diagnostics.location_ranges) >= MAX_JSON_LOCATION_RANGES:
+                break
+            if (
+                isinstance(item, dict)
+                and item.get("start") is not None
+                and item.get("end") is not None
+            ):
+                diagnostics.location_ranges.append(
+                    (int(item["start"]), int(item["end"]))
+                )
+        diagnostics.omitted_location_count = int(
+            value.get("omitted_location_count", 0)
+        )
+        reason_counts = value.get("reason_counts") or {}
+        if not isinstance(reason_counts, dict):
+            raise TypeError("reason_counts must be an object")
+        for reason, count in reason_counts.items():
+            if len(diagnostics.reason_counts) >= MAX_JSON_REASON_TYPES:
+                break
+            normalized_reason = " ".join(str(reason).split())[
+                :MAX_JSON_REASON_LENGTH
+            ]
+            diagnostics.reason_counts[normalized_reason] = int(count)
+        diagnostics.omitted_reason_count = int(
+            value.get("omitted_reason_count", 0)
+        )
+        return diagnostics
+
+    @classmethod
+    def from_legacy_messages(
+        cls,
+        path: Path,
+        messages: list[Any],
+    ) -> "JsonRecordDiagnostics":
+        """Compact an old cache's unbounded per-record message list."""
+
+        diagnostics = cls(path=path)
+        location_pattern = re.compile(
+            r"(?:line|record)\s+(\d+)\s*:\s*(.*?)(?:\.)?$"
+        )
+        for message in messages:
+            text = str(message)
+            match = location_pattern.search(text)
+            if match:
+                diagnostics.add(int(match.group(1)), match.group(2))
+            else:
+                diagnostics.add(0, text)
+        return diagnostics
+
+    def _location_summary(self) -> str:
+        values = []
+        for start, end in self.location_ranges:
+            values.append(str(start) if start == end else f"{start}-{end}")
+        summary = ", ".join(values)
+        if self.omitted_location_count:
+            suffix = f"{self.omitted_location_count:,} more"
+            summary = f"{summary}, {suffix}" if summary else suffix
+        if not summary:
+            return ""
+        label = self.location_kind
+        if len(self.location_ranges) != 1 or (
+            self.location_ranges and self.location_ranges[0][0] != self.location_ranges[0][1]
+        ) or self.omitted_location_count:
+            label += "s"
+        return f"{label} {summary}"
+
+
+@dataclass
 class StructuredDocumentLoad:
     """Structured documents plus per-record diagnostics and source files."""
 
     documents: list[Document]
-    issues: list[JsonRecordIssue]
+    issues: list[JsonRecordDiagnostics]
     source_files: list[Path]
+
+    @property
+    def diagnostics(self) -> list[JsonRecordDiagnostics]:
+        """Return bounded per-file issues under the explicit new name."""
+
+        return self.issues
 
 
 def document_to_dict(document: Document) -> dict[str, Any]:
@@ -292,33 +469,36 @@ def load_jsonl_documents(
     on_invalid: Optional[Callable[[str], None]] = None,
 ) -> list[Document]:
     """Load each JSONL record as an independent training document."""
+    return load_jsonl_documents_with_diagnostics(
+        path,
+        lowercase=lowercase,
+        on_invalid=on_invalid,
+    ).documents
+
+
+def load_jsonl_documents_with_diagnostics(
+    path: Path,
+    lowercase: bool = False,
+    on_invalid: Optional[Callable[[str], None]] = None,
+) -> StructuredDocumentLoad:
+    """Load independent JSONL records with one bounded file diagnostic."""
+
     documents: list[Document] = []
+    diagnostics = JsonRecordDiagnostics(path=path)
     record_seen = False
     for index, record, error in _iter_json_records_with_errors(path):
         record_seen = True
         if error:
-            _report_json_issue(
-                JsonRecordIssue(path, index, error),
-                issues=None,
-                on_invalid=on_invalid,
-            )
+            diagnostics.add(index, error)
             continue
         kind = _structured_record_kind(record)
         validation_error = _structured_record_error(record, kind)
         if validation_error:
-            _report_json_issue(
-                JsonRecordIssue(path, index, validation_error),
-                issues=None,
-                on_invalid=on_invalid,
-            )
+            diagnostics.add(index, validation_error)
             continue
         text = clean_text(_extract_structured_text(record, kind), lowercase=lowercase)
         if not text:
-            _report_json_issue(
-                JsonRecordIssue(path, index, "record contains no extractable text"),
-                issues=None,
-                on_invalid=on_invalid,
-            )
+            diagnostics.add(index, "record contains no extractable text")
             continue
         documents.append(
             Document(
@@ -329,12 +509,10 @@ def load_jsonl_documents(
             )
         )
     if not record_seen:
-        _report_json_issue(
-            JsonRecordIssue(path, 0, "file contains no records"),
-            issues=None,
-            on_invalid=on_invalid,
-        )
-    return documents
+        diagnostics.add(0, "file contains no records")
+    result_diagnostics = [diagnostics] if diagnostics.invalid_record_count else []
+    _emit_json_diagnostics(result_diagnostics, on_invalid)
+    return StructuredDocumentLoad(documents, result_diagnostics, [path])
 
 
 def _iter_json_records(path: Path) -> list[Any]:
@@ -542,45 +720,30 @@ def load_structured_json_documents_with_diagnostics(
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Structured dataset path does not exist: {path}")
-    files = [path] if path.is_file() else sorted(item for item in path.rglob("*") if item.suffix.lower() in {".json", ".jsonl"})
+    files = structured_json_source_files(path)
     if not files:
         raise ValueError(f"No .json or .jsonl files found in {path}")
 
     documents: list[Document] = []
-    issues: list[JsonRecordIssue] = []
+    diagnostics_by_file: list[JsonRecordDiagnostics] = []
     for file_path in files:
         if file_path.suffix.lower() not in {".json", ".jsonl"}:
             raise ValueError(f"Unsupported structured dataset file: {file_path}")
+        diagnostics = JsonRecordDiagnostics(path=file_path)
         record_seen = False
         for index, record, error in _iter_json_records_with_errors(file_path):
             record_seen = True
             if error:
-                _report_json_issue(
-                    JsonRecordIssue(file_path, index, error),
-                    issues,
-                    on_invalid,
-                )
+                diagnostics.add(index, error)
                 continue
             validation_error = _structured_record_error(record, kind)
             if validation_error:
-                _report_json_issue(
-                    JsonRecordIssue(file_path, index, validation_error),
-                    issues,
-                    on_invalid,
-                )
+                diagnostics.add(index, validation_error)
                 continue
             text = _extract_structured_text(record, kind)
             text = clean_code(text, lowercase=lowercase)
             if not text:
-                _report_json_issue(
-                    JsonRecordIssue(
-                        file_path,
-                        index,
-                        "record contains no extractable text",
-                    ),
-                    issues,
-                    on_invalid,
-                )
+                diagnostics.add(index, "record contains no extractable text")
                 continue
             documents.append(
                 Document(
@@ -591,24 +754,36 @@ def load_structured_json_documents_with_diagnostics(
                 )
             )
         if not record_seen:
-            _report_json_issue(
-                JsonRecordIssue(file_path, 0, "file contains no records"),
-                issues,
-                on_invalid,
-            )
-    return StructuredDocumentLoad(documents, issues, files)
+            diagnostics.add(0, "file contains no records")
+        if diagnostics.invalid_record_count:
+            diagnostics_by_file.append(diagnostics)
+    _emit_json_diagnostics(diagnostics_by_file, on_invalid)
+    return StructuredDocumentLoad(documents, diagnostics_by_file, files)
 
 
-def _report_json_issue(
-    issue: JsonRecordIssue,
-    issues: Optional[list[JsonRecordIssue]],
+def structured_json_source_files(path: Path) -> list[Path]:
+    """Return the physical JSON/JSONL sources represented by a configured path."""
+
+    path = Path(path)
+    if path.is_file():
+        return [path]
+    return sorted(
+        item
+        for item in path.rglob("*")
+        if item.suffix.lower() in {".json", ".jsonl"}
+    )
+
+
+def _emit_json_diagnostics(
+    diagnostics: list[JsonRecordDiagnostics],
     on_invalid: Optional[Callable[[str], None]],
 ) -> None:
-    LOGGER.warning("%s", issue.message())
-    if issues is not None:
-        issues.append(issue)
-    if on_invalid is not None:
-        on_invalid(issue.message())
+    for diagnostic in diagnostics:
+        message = diagnostic.summary()
+        if on_invalid is not None:
+            on_invalid(message)
+        else:
+            LOGGER.warning("%s", message)
 
 
 def _structured_record_kind(record: Any) -> str:

@@ -74,7 +74,12 @@ def prepare(args: argparse.Namespace) -> None:
         f"Documents: {result.document_count} | Characters: {result.character_count} | "
         f"Tokens: {result.token_count} | Vocab: {result.vocab_size}"
     )
-    print(f"Cache: reused {result.cached_file_count} file(s) | processed {result.processed_file_count} file(s)")
+    print(
+        f"Sources: reused {result.cached_file_count} clean file(s) | "
+        f"processed {result.processed_file_count} clean file(s) | "
+        f"partial {result.partial_file_count} file(s) | "
+        f"failed {result.failed_file_count} file(s)"
+    )
 
 
 def train(args: argparse.Namespace) -> None:
