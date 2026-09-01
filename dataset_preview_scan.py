@@ -332,9 +332,6 @@ def scan_dataset_preview(
 
 
 __all__ = [
-    "ProjectHealthResult",
     "DatasetPreviewResult",
-    "check_project_health",
     "scan_dataset_preview",
 ]
-

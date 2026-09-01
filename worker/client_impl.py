@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-import json
 import hashlib
 import os
 import platform
@@ -8,18 +7,14 @@ import shutil
 import socket
 import time
 import zipfile
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urljoin
-from urllib.request import Request, urlopen
 
 import torch
 
 from engine.coordinator.artifacts import create_result_artifact_bundle
 from engine.contracts import (
     ArtifactSpec,
-    BackendKind,
     ClaimJobRequest,
     ClaimJobResponse,
     CompleteJobRequest,
@@ -35,13 +30,12 @@ from engine.contracts import (
     WorkerCapabilities,
 )
 from engine.contracts.jobs import JobStatus, TrainingJobSpec
+from engine.gpu_discovery import discover_gpus
 from engine.training_orchestrator import train_from_dataset
 try:
     import psutil
 except ImportError:
     psutil = None
-from app.gpu_discovery import discover_gpus
-
 from .client_core import CoordinatorHttpClient, WorkerClientConfig
 class RemoteWorkerClient:
     """Remote worker client that talks to the coordinator API."""
@@ -279,14 +273,20 @@ class RemoteWorkerClient:
             if not local.is_file() or _file_sha256(local) != digest:
                 self.http.download(f"{base_url}/{relative.as_posix()}", local)
                 if _file_sha256(local) != digest:
-                    local.unlink(missing_ok=True); self.http.download(f"{base_url}/{relative.as_posix()}", local)
-                    if _file_sha256(local) != digest: raise ValueError(f"Project file integrity check failed: {relative}")
+                    local.unlink(missing_ok=True)
+                    self.http.download(f"{base_url}/{relative.as_posix()}", local)
+                    if _file_sha256(local) != digest:
+                        raise ValueError(
+                            f"Project file integrity check failed: {relative}"
+                        )
         for local in input_dir.rglob("*"):
             if local.is_file() and local.relative_to(input_dir).as_posix() not in expected:
                 local.unlink()
         dataset_dir = input_dir / "dataset"
-        if not dataset_dir.exists(): raise FileNotFoundError("Project manifest does not contain dataset/")
-        output_dir = workspace / "model"; output_dir.mkdir(parents=True, exist_ok=True)
+        if not dataset_dir.exists():
+            raise FileNotFoundError("Project manifest does not contain dataset/")
+        output_dir = workspace / "model"
+        output_dir.mkdir(parents=True, exist_ok=True)
         job.dataset = DatasetSpec.from_dataset_dir(dataset_dir)
         job.training.output_dir = output_dir
         job.artifacts = ArtifactSpec.from_output_dir(output_dir)
@@ -329,7 +329,10 @@ class RemoteWorkerClient:
         """Collect a compact, cross-platform heartbeat telemetry snapshot."""
         snapshot: dict[str, Any] = {"gpus": [gpu.to_jsonable() for gpu in discover_gpus()]}
         if psutil is not None:
-            memory = psutil.virtual_memory(); disk = psutil.disk_usage(str(Path(self.config.workspace_dir).anchor or Path.cwd()))
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage(
+                str(Path(self.config.workspace_dir).anchor or Path.cwd())
+            )
             network = psutil.net_io_counters()
             snapshot.update({"cpu_percent": psutil.cpu_percent(), "ram_percent": memory.percent,
                 "free_ram_gb": memory.available / (1024**3), "free_disk_gb": disk.free / (1024**3),
@@ -358,13 +361,6 @@ def detect_worker_capabilities() -> WorkerCapabilities:
     gpu_records = [gpu.to_jsonable() for gpu in discover_gpus()]
     gpu_names: list[str] = [str(gpu["name"]) for gpu in gpu_records]
     total_vram_gb: Optional[float] = sum(float(gpu.get("vram_total_gb") or 0) for gpu in gpu_records) or None
-    if torch.cuda.is_available():
-        total_vram_bytes = 0
-        for index in range(torch.cuda.device_count()):
-            properties = torch.cuda.get_device_properties(index)
-            gpu_names.append(properties.name)
-            total_vram_bytes += int(properties.total_memory)
-        total_vram_gb = total_vram_bytes / (1024**3)
     system_ram_gb = None
     if psutil is not None:
         system_ram_gb = psutil.virtual_memory().total / (1024**3)
@@ -479,4 +475,3 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-

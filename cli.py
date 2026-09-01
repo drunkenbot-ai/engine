@@ -17,7 +17,6 @@ from .export import export_hf_microgpt_package
 from .dataset_build import build_dataset
 from .training_orchestrator import train_from_dataset
 from .tokenizer import load_tokenizer
-from .worker import WorkerClientConfig, run_worker_client
 
 
 def prepare(args: argparse.Namespace) -> None:
@@ -75,7 +74,12 @@ def prepare(args: argparse.Namespace) -> None:
         f"Documents: {result.document_count} | Characters: {result.character_count} | "
         f"Tokens: {result.token_count} | Vocab: {result.vocab_size}"
     )
-    print(f"Cache: reused {result.cached_file_count} file(s) | processed {result.processed_file_count} file(s)")
+    print(
+        f"Sources: reused {result.cached_file_count} clean file(s) | "
+        f"processed {result.processed_file_count} clean file(s) | "
+        f"partial {result.partial_file_count} file(s) | "
+        f"failed {result.failed_file_count} file(s)"
+    )
 
 
 def train(args: argparse.Namespace) -> None:
@@ -222,6 +226,8 @@ def worker_client(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments for the worker client command.
     """
+
+    from .worker import WorkerClientConfig, run_worker_client
 
     labels = [item.strip() for item in args.labels.split(",") if item.strip()]
     config = WorkerClientConfig(
@@ -407,4 +413,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,17 +1,21 @@
 ﻿from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import json
 import logging
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import subprocess
 import sys
 from threading import Thread
 from typing import Any, Callable, Optional
-from queue import Queue, Empty
-import json
 
-from .data import Document, clean_text
-from .conversation_presets import *
+from .data import Document
+from .conversation_presets import (
+    CONVERSATION_DATASET_PRESETS,
+    ConversationDatasetPreset,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -306,6 +310,4 @@ def _emit(progress: Optional[Callable[[Any], None]], message: str, percent: Opti
 
     if progress:
         progress({"message": message, "percent": percent})
-
-
 

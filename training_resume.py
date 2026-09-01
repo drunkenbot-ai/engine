@@ -1,43 +1,14 @@
 ﻿from __future__ import annotations
 
-import json
-import math
 import os
-import random
-from dataclasses import dataclass
 from pathlib import Path
-from time import perf_counter
-from typing import Any, Callable, Optional, Union
+from typing import Any, Optional
 
-import numpy as np
-import numpy.lib.format as npy_format
 import torch
-import torch.nn.functional as F
-from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset
 
-from .config import ModelConfig, TrainingConfig, dataclass_to_jsonable
-from .model import (
-    MicroGPT,
-    apply_lora_adapters,
-    freeze_non_lora_parameters,
-    load_lora_state_dict,
-    lora_parameter_count,
-    lora_state_dict,
-    merge_lora_adapters,
-)
-
-try:
-    import psutil
-except ImportError:
-    psutil = None
-
-
-
-from .training_core import *
-from .training_runtime import *
-from .training_evaluation import *
-from .training_evaluation import *
+from .config import ModelConfig, TrainingConfig
+from .model import MicroGPT
+from .training_runtime import ResumeCompatibilityReport
 
 def latest_checkpoint(checkpoints_dir: Path) -> Optional[Path]:
     """Find the newest checkpoint in a folder.
@@ -50,7 +21,11 @@ def latest_checkpoint(checkpoints_dir: Path) -> Optional[Path]:
     """
 
     checkpoints = sorted(
-        checkpoints_dir.glob("checkpoint_*.pt"),
+        (
+            path
+            for path in checkpoints_dir.glob("checkpoint_*.pt")
+            if path.name != "checkpoint_best_val.pt"
+        ),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -319,7 +294,5 @@ def _estimated_training_vram_bytes(model: MicroGPT, model_config: ModelConfig, t
     )
     logits = training_config.batch_size * model_config.context_length * model_config.vocab_size * activation_bytes_per_value
     return int((parameter_and_optimizer + activations + logits) * 1.15)
-
-
 
 

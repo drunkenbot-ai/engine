@@ -73,7 +73,8 @@ def create_job_project_tree(job: TrainingJobSpec, artifact_root: Optional[Path] 
     for source in Path(job.dataset.dataset_dir).rglob("*"):
         if source.is_file():
             target = tree / "dataset" / source.relative_to(job.dataset.dataset_dir)
-            target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(source, target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
     (tree / "job.json").write_text(json.dumps(job.to_jsonable(), indent=2), encoding="utf-8")
     job.metadata["project_id"] = project_id
     job.metadata["project_manifest_url"] = f"{base_url.rstrip('/')}/projects/{project_id}/tree-manifest"
@@ -119,4 +120,3 @@ def _write_directory(archive: zipfile.ZipFile, source: Path, archive_root: str) 
     for path in source.rglob("*"):
         if path.is_file():
             archive.write(path, Path(archive_root) / path.relative_to(source))
-

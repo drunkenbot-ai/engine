@@ -17,8 +17,8 @@ from .model import (
     apply_lora_adapters,
     freeze_non_lora_parameters,
     load_lora_state_dict,
+    lora_adapter_count,
     lora_parameter_count,
-    merge_lora_adapters,
 )
 from .training_checkpoint import save_checkpoint
 from .training_evaluation import TrainingStopRequested, evaluate
@@ -55,6 +55,23 @@ def _model_weight_norm(model: MicroGPT) -> float:
         return 0.0
     return float(torch.sqrt(torch.stack(squared_norms).sum()).item())
 
+
+def _system_metrics(
+    progress: Optional[Callable[[Any], None]],
+) -> dict[str, Optional[float]]:
+    """Sample host utilization only when an event consumer exists."""
+
+    if progress is None:
+        return {
+            "system_cpu_percent": None,
+            "system_ram_percent": None,
+        }
+    return {
+        "system_cpu_percent": system_cpu_percent(),
+        "system_ram_percent": system_ram_percent(),
+    }
+
+
 def _export_final_artifacts(
     model: MicroGPT,
     optimizer: torch.optim.Optimizer,
@@ -71,12 +88,74 @@ def _export_final_artifacts(
     adapter_path = None
     if training_config.peft_method == "lora":
         adapter_path = training_config.output_dir / "final_adapter.pt"
-        save_checkpoint(adapter_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, train_loss, val_loss)
-        merged_count = merge_lora_adapters(model)
+        save_checkpoint(adapter_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, train_loss, val_loss, artifact_type="adapter")
+        merged_count = lora_adapter_count(model)
         emit_progress(progress, f"Merged {merged_count} LoRA adapter module(s) into final model weights.", 96)
     checkpoint_path = training_config.output_dir / "final_model.pt"
-    save_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, train_loss, val_loss)
+    save_checkpoint(checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, training_config.epochs, train_loss, val_loss, artifact_type="inference")
     return checkpoint_path, adapter_path
+
+
+def _save_best_validation_artifacts(
+    checkpoints_dir: Path,
+    model: MicroGPT,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: GradScaler,
+    model_config: ModelConfig,
+    training_config: TrainingConfig,
+    global_step: int,
+    epoch: int,
+    train_loss: float,
+    val_loss: float,
+) -> tuple[Path, Path]:
+    """Save a chat-loadable best model and a separate resumable checkpoint."""
+
+    best_path = checkpoints_dir / "checkpoint_best_val.pt"
+    if training_config.peft_method == "lora":
+        resume_path = checkpoints_dir / "checkpoint_best_val_resume.pt"
+        save_checkpoint(
+            resume_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            model_config,
+            training_config,
+            global_step,
+            epoch,
+            train_loss,
+            val_loss,
+        )
+        save_checkpoint(
+            best_path,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            model_config,
+            training_config,
+            global_step,
+            epoch,
+            train_loss,
+            val_loss,
+            artifact_type="inference",
+        )
+        return best_path, resume_path
+    save_checkpoint(
+        best_path,
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        model_config,
+        training_config,
+        global_step,
+        epoch,
+        train_loss,
+        val_loss,
+    )
+    return best_path, best_path
 
 def train_model(model_config: ModelConfig, training_config: TrainingConfig, train_tokens: Union[list[int], np.ndarray], val_tokens: Union[list[int], np.ndarray], pad_token_id: int, progress: Optional[Callable[[Any], None]]=None, should_stop: Optional[Callable[[], bool]]=None, decode_preview: Optional[Callable[[list[int]], str]]=None) -> TrainingResult:
     """Train a MicroGPT model.
@@ -124,6 +203,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     final_val_loss: Optional[float] = None
     best_val_loss: Optional[float] = None
     best_checkpoint_path: Optional[Path] = None
+    best_resume_checkpoint_path: Optional[Path] = None
     early_stop_counter = 0
     early_stopped = False
     resume_path = training_config.resume_from_checkpoint if training_config.resume else None
@@ -158,6 +238,13 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     emit_progress(progress, f'Optimizer: {training_config.optimizer_name}, schedule: {training_config.scheduler_name}, precision: {training_config.precision}.', 5)
     if resume_path and Path(resume_path).exists():
         emit_progress(progress, f'Resuming from checkpoint: {resume_path}', 6)
+        checkpoint = resume_checkpoint or torch.load(resume_path, map_location='cpu')
+        artifact_type = checkpoint.get('artifact_type')
+        if artifact_type not in {None, 'resume'}:
+            raise ValueError(
+                f'Checkpoint {resume_path} is a {artifact_type} artifact and cannot '
+                'resume training. Select a resume checkpoint instead.'
+            )
         compatibility = resume_compatibility or check_resume_compatibility(Path(resume_path), model_config, training_config)
         for line in compatibility.info:
             emit_progress(progress, line, 6)
@@ -174,7 +261,6 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         if strict_resume_errors:
             message = 'Checkpoint is not compatible with the current training settings:\n' + '\n'.join((f'- {line}' for line in strict_resume_errors))
             raise ValueError(message)
-        checkpoint = resume_checkpoint or torch.load(resume_path, map_location='cpu')
         if training_config.peft_method == 'lora' and 'adapter_state_dict' in checkpoint:
             load_lora_state_dict(model, checkpoint['adapter_state_dict'])
         else:
@@ -232,6 +318,8 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     )
     last_metric_time = perf_counter()
     steps_since_metric = 0
+    samples_since_metric = 0
+    tokens_since_metric = 0
     step_time_window: list[float] = []
     for epoch in range(start_epoch, training_config.epochs):
         epoch_loss_sum: Optional[torch.Tensor] = None
@@ -252,6 +340,8 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
             batch_loss = loss.detach() * training_config.gradient_accumulation
             epoch_loss_sum = batch_loss if epoch_loss_sum is None else epoch_loss_sum + batch_loss
             epoch_loss_count += 1
+            samples_since_metric += int(x.shape[0])
+            tokens_since_metric += int(x.numel())
             scaler.scale(loss).backward()
             should_step = (batch_index + 1) % training_config.gradient_accumulation == 0 or batch_index + 1 == epoch_batch_count
             if should_step:
@@ -264,9 +354,8 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                 scheduler.step()
                 global_step += 1
                 steps_since_metric += 1
-                sample = cadence.sample()
                 current_progress = 8 + int(86 * min(global_step, total_steps) / max(total_steps, 1))
-                if sample.metrics:
+                if progress is not None and (sample := cadence.sample()).metrics:
                     step_seconds = max(sample.sampled_at - last_metric_time, 1e-09)
                     last_metric_time = sample.sampled_at
                     average_step_seconds = step_seconds / max(steps_since_metric, 1)
@@ -275,13 +364,11 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                     average_step_seconds = sum(step_time_window) / max(len(step_time_window), 1)
                     remaining_steps = max(total_steps - global_step, 0)
                     eta_seconds = remaining_steps * average_step_seconds
-                    samples_seen = (
-                        training_config.batch_size
-                        * training_config.gradient_accumulation
-                        * steps_since_metric
-                    )
-                    tokens_seen = samples_seen * model_config.context_length
                     steps_since_metric = 0
+                    samples_seen = samples_since_metric
+                    tokens_seen = tokens_since_metric
+                    samples_since_metric = 0
+                    tokens_since_metric = 0
                     latest_loss_scalar = float(batch_loss.item())
                     grad_norm = None
                     weight_norm = None
@@ -333,25 +420,28 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                         vram_allocated_gb=vram_allocated_gb,
                         vram_reserved_gb=vram_reserved_gb,
                         gpu_memory_percent=gpu_memory_percent,
-                        system_cpu_percent=system_cpu_percent(),
-                        system_ram_percent=system_ram_percent(),
+                        **_system_metrics(progress),
                         data_loader_workers=loader_workers,
                         sample_text=sample_text,
                     )
                 if val_loader is not None and training_config.eval_interval > 0 and (global_step % training_config.eval_interval == 0):
                     if latest_loss_scalar is None:
                         latest_loss_scalar = float(batch_loss.item())
-                    emit_progress(progress, f'Running validation at step {global_step}...', current_progress, event_type='validation', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=latest_loss_scalar, val_loss=final_val_loss, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent())
+                    emit_progress(progress, f'Running validation at step {global_step}...', current_progress, event_type='validation', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=latest_loss_scalar, val_loss=final_val_loss, **_system_metrics(progress))
                     try:
                         final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, current_progress)
                     except TrainingStopRequested:
                         current_train_loss = float((epoch_loss_sum / max(epoch_loss_count, 1)).item()) if epoch_loss_sum is not None else final_train_loss
                         return finish_stopped(epoch, current_train_loss)
-                    emit_progress(progress, f'Validation loss at step {global_step}: {final_val_loss:.4f}', current_progress, event_type='validation', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=latest_loss_scalar, val_loss=final_val_loss, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent())
+                    emit_progress(progress, f'Validation loss at step {global_step}: {final_val_loss:.4f}', current_progress, event_type='validation', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=latest_loss_scalar, val_loss=final_val_loss, **_system_metrics(progress))
                     if best_val_loss is None or final_val_loss < best_val_loss:
                         best_val_loss = final_val_loss
-                        best_checkpoint_path = checkpoints_dir / 'checkpoint_best_val.pt'
-                        save_checkpoint(best_checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch + 1, latest_loss_scalar if latest_loss_scalar is not None else final_train_loss, final_val_loss)
+                        best_checkpoint_path, best_resume_checkpoint_path = _save_best_validation_artifacts(
+                            checkpoints_dir, model, optimizer, scheduler, scaler,
+                            model_config, training_config, global_step, epoch + 1,
+                            latest_loss_scalar if latest_loss_scalar is not None else final_train_loss,
+                            final_val_loss,
+                        )
                         emit_progress(progress, f'New best validation checkpoint: {best_checkpoint_path.name} ({best_val_loss:.4f}).', current_progress, event_type='checkpoint', checkpoint_quality='best_validation', best_val_loss=best_val_loss, best_checkpoint_path=str(best_checkpoint_path))
                         early_stop_counter = 0
                     elif training_config.early_stopping and best_val_loss is not None:
@@ -376,8 +466,11 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                 return finish_stopped(epoch + 1, final_train_loss)
             if best_val_loss is None or final_val_loss < best_val_loss:
                 best_val_loss = final_val_loss
-                best_checkpoint_path = checkpoints_dir / 'checkpoint_best_val.pt'
-                save_checkpoint(best_checkpoint_path, model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch + 1, final_train_loss, final_val_loss)
+                best_checkpoint_path, best_resume_checkpoint_path = _save_best_validation_artifacts(
+                    checkpoints_dir, model, optimizer, scheduler, scaler,
+                    model_config, training_config, global_step, epoch + 1,
+                    final_train_loss, final_val_loss,
+                )
                 emit_progress(progress, f'New best validation checkpoint: {best_checkpoint_path.name} ({best_val_loss:.4f}).', 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)), checkpoint_quality='best_validation', best_val_loss=best_val_loss, best_checkpoint_path=str(best_checkpoint_path))
                 early_stop_counter = 0
             elif training_config.early_stopping and best_val_loss is not None:
@@ -388,12 +481,12 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                     early_stopped = True
         print(f'epoch {epoch + 1}/{training_config.epochs}: train_loss={final_train_loss:.4f}')
         save_checkpoint(checkpoints_dir / f'checkpoint_epoch_{epoch + 1}.pt', model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch + 1, final_train_loss, final_val_loss)
-        emit_progress(progress, f'Epoch {epoch + 1} complete. Checkpoint saved.', 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)), event_type='checkpoint', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss, system_cpu_percent=system_cpu_percent(), system_ram_percent=system_ram_percent())
+        emit_progress(progress, f'Epoch {epoch + 1} complete. Checkpoint saved.', 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)), event_type='checkpoint', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss, **_system_metrics(progress))
         if early_stopped:
             break
     checkpoint_path, adapter_path = _export_final_artifacts(model, optimizer, scheduler, scaler, model_config, training_config, global_step, final_train_loss, final_val_loss, progress)
     summary_path = training_config.output_dir / 'training_summary.json'
-    summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'best_val_loss': best_val_loss, 'best_checkpoint_path': str(best_checkpoint_path) if best_checkpoint_path else None, 'recommended_checkpoint_path': str(best_checkpoint_path or checkpoint_path), 'total_steps': global_step, 'parameters': sum((p.numel() for p in model.parameters())), 'adapter_checkpoint': str(training_config.output_dir / 'final_adapter.pt') if training_config.peft_method == 'lora' else None, 'early_stopped': early_stopped}
+    summary = {'model_config': dataclass_to_jsonable(model_config), 'training_config': dataclass_to_jsonable(training_config), 'final_train_loss': final_train_loss, 'final_val_loss': final_val_loss, 'best_val_loss': best_val_loss, 'best_checkpoint_path': str(best_checkpoint_path) if best_checkpoint_path else None, 'best_resume_checkpoint_path': str(best_resume_checkpoint_path) if best_resume_checkpoint_path else None, 'recommended_checkpoint_path': str(best_checkpoint_path or checkpoint_path), 'total_steps': global_step, 'parameters': sum((p.numel() for p in model.parameters())), 'adapter_checkpoint': str(training_config.output_dir / 'final_adapter.pt') if training_config.peft_method == 'lora' else None, 'early_stopped': early_stopped}
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
     emit_progress(progress, 'Training stopped early - validation loss converged.' if early_stopped else 'Training complete.', 100, event_type='completion', epoch=training_config.epochs, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=final_train_loss, val_loss=final_val_loss)
     return TrainingResult(checkpoint_path, summary_path, final_train_loss, final_val_loss)

@@ -2,11 +2,30 @@
 
 The core API of drunkenBot IDE.
 
+## Structured dataset preparation
+
+Malformed or schema-invalid JSON/JSONL records are grouped into one bounded
+diagnostic per source file. Each manifest entry uses `record_diagnostics` with
+the complete `invalid_record_count`, at most 12 compressed `location_ranges`,
+an `omitted_location_count`, bounded `reason_counts`, and a human-readable
+`summary`. Valid JSONL rows remain independent documents.
+
+`DatasetBuildResult` and `dataset_summary.json` expose `partial_file_count`,
+`failed_file_count`, `invalid_record_count`, and `preparation_outcome`.
+Each affected source emits one bounded `event_type="dataset_diagnostic"` event
+with `level`, per-source `outcome`, `source_path`, and the compact `diagnostic`
+object.
+Preparation emits exactly one terminal progress event with
+`event_type="completion"` and `outcome="completed"` or
+`"completed_with_warnings"`; the event repeats the partial, failed, and invalid
+counts for UI consumers. A file is partial only when it produced usable data
+alongside invalid records. Files with no usable records are failed.
+
 ## Standalone local training worker
 
 Local training can run outside the desktop process, with no Qt dependency. Create
 a `TrainingJobSpec`, wrap it with
-`training_worker_protocol.create_worker_request()`, atomically persist it with
+`engine.training_worker_protocol.create_worker_request()`, atomically persist it with
 `write_worker_request()`, and launch it with
 `launch_worker_process(request_path)`. The equivalent stable command is:
 
@@ -20,6 +39,10 @@ and starts a new process session/process group. The UI may release the returned
 worker with `QThread`. A crash-recoverable `training_worker.lock` claim prevents
 two workers from writing the same output directory; worker exit code `2` means a
 launch was rejected because an active or already-finished run identity exists.
+Claim creation, stale recovery, and release are serialized by an OS-backed
+mutex file whose lock is released automatically if an acquiring process exits;
+if that mutex cannot be acquired, launch fails closed rather than unlinking a
+claim whose ownership transition cannot be proven.
 Each run has its own manifest/control directory, so a prior stop sentinel cannot
 affect a later run.
 
@@ -115,8 +138,9 @@ process.
 Lifecycle, warning, validation, checkpoint, stop, failure, and completion events
 remain immediate. Unsampled optimizer steps perform no parameter traversal,
 preview copy/decode, system sampling, scalar loss conversion, or progress
-callback. Throughput uses all steps and actual wall-clock time since the previous
-sample.
+callback. Throughput uses the exact batches and tokens completed during the
+wall-clock sample window; `average_step_seconds` normalizes that window by the
+number of completed optimizer steps.
 
 The worker owns one `TelemetryWriter` connection in WAL mode, batches metric
 samples and ordinary lifecycle records, and force-flushes validation, checkpoint,
