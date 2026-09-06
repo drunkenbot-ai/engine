@@ -387,3 +387,35 @@ def test_stdlib_process_identity_fallback_is_verifiable(monkeypatch) -> None:
 
     assert identity["kind"] != "unverifiable"
     assert process_identity_matches(os.getpid(), identity)
+
+
+def test_load_json_retries_transient_permission_error(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "data.json"
+    target.write_text('{"status": "ok"}', encoding="utf-8")
+    attempts = [0]
+    original_read_text = Path.read_text
+
+    def flaky_read(self, *args, **kwargs):
+        if self == target and attempts[0] < 2:
+            attempts[0] += 1
+            raise PermissionError(13, "Permission denied")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read)
+
+    data = protocol_module._load_json(target, max_retries=5, retry_delay=0.01)
+    assert data == {"status": "ok"}
+    assert attempts[0] == 2
+
+
+def test_load_json_raises_when_permission_error_persists(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "data.json"
+    target.write_text('{"status": "ok"}', encoding="utf-8")
+
+    def failing_read(self, *args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "read_text", failing_read)
+
+    with pytest.raises(PermissionError, match="Permission denied"):
+        protocol_module._load_json(target, max_retries=3, retry_delay=0.01)

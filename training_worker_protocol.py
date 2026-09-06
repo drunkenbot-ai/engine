@@ -622,24 +622,45 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        for attempt in range(10):
+        for attempt in range(20):
             try:
                 os.replace(temp_path, path)
                 break
             except PermissionError:
-                if attempt == 9:
+                if attempt == 19:
                     raise
-                time.sleep(0.01 * (attempt + 1))
+                time.sleep(0.02 * (attempt + 1))
     finally:
         if temp_path.exists():
             temp_path.unlink()
 
 
-def _load_json(path: Path) -> dict[str, Any]:
-    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    if not isinstance(data, dict):
-        raise ValueError(f"Expected a JSON object in {path}")
-    return data
+def _load_json(
+    path: Path,
+    *,
+    max_retries: int = 20,
+    retry_delay: float = 0.05,
+) -> dict[str, Any]:
+    path = Path(path)
+    for attempt in range(max_retries):
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+            if not raw.strip():
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (1 + attempt * 0.1))
+                    continue
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError(f"Expected a JSON object in {path}")
+            return data
+        except PermissionError:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(retry_delay * (1 + attempt * 0.1))
+        except json.JSONDecodeError:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(retry_delay * (1 + attempt * 0.1))
 
 
 def _validate_envelope(data: dict[str, Any], schema: str) -> None:
