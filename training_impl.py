@@ -1,5 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+
 import json
+import logging
 import math
 from pathlib import Path
 from time import perf_counter
@@ -43,17 +45,76 @@ from .training_runtime import (
 )
 from .training_telemetry import TelemetryCadence
 
+logger = logging.getLogger(__name__)
+
 
 def _model_weight_norm(model: MicroGPT) -> float:
-    """Compute one combined weight norm with a single device-to-host conversion."""
+    """Compute the combined L2 weight norm without fp32 upcast.
 
-    squared_norms = [
-        torch.linalg.vector_norm(parameter.detach().float()) ** 2
-        for parameter in model.parameters()
-    ]
-    if not squared_norms:
+    Flattens all parameters into a single contiguous view so the
+    norm is computed with one kernel launch and one device-to-host
+    transfer instead of one per parameter.
+
+    Args:
+        model: Model whose weight norm is computed.
+
+    Returns:
+        Combined L2 norm across all model parameters.
+    """
+    params = [p.detach().reshape(-1) for p in model.parameters()]
+    if not params:
         return 0.0
-    return float(torch.sqrt(torch.stack(squared_norms).sum()).item())
+    flat = torch.cat(params)
+    return float(torch.linalg.vector_norm(flat).item())
+
+
+def _try_compile_model(
+    model: torch.nn.Module,
+    device: str,
+) -> torch.nn.Module:
+    """Apply ``torch.compile`` when the runtime supports it.
+
+    Only compiles on CUDA devices where kernel fusion provides
+    meaningful throughput gains.  Falls back gracefully on older
+    PyTorch builds or when the Triton compiler is unavailable
+    (common on Windows).
+
+    Args:
+        model: Model to compile.
+        device: Training device string (e.g. ``"cuda"`` or ``"cpu"``).
+
+    Returns:
+        Compiled model, or the original model on failure.
+    """
+    if not device.startswith("cuda"):
+        logger.info("torch.compile skipped on non-CUDA device.")
+        return model
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        logger.info("torch.compile not available — skipping.")
+        return model
+    try:
+        compiled = compile_fn(model)
+        logger.info("torch.compile applied successfully.")
+        return compiled
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("torch.compile failed (%s) — training without it.", exc)
+        return model
+
+
+def _gpu_scalar_to_float(tensor: torch.Tensor) -> float:
+    """Convert a scalar GPU tensor to a Python float.
+
+    This is a thin wrapper that makes `.item()` sync points
+    explicit and easy to grep for during profiling.
+
+    Args:
+        tensor: Scalar tensor (any device).
+
+    Returns:
+        Python float value.
+    """
+    return float(tensor.item())
 
 
 def _system_metrics(
@@ -183,6 +244,9 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     model = MicroGPT(model_config).to(training_config.device)
     model.enable_gradient_checkpointing(training_config.activation_checkpointing)
     if training_config.device.startswith('cuda') and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
         free_vram, total_vram = torch.cuda.mem_get_info()
         estimate = _estimated_training_vram_bytes(model, model_config, training_config)
         emit_progress(progress, f'VRAM preflight: estimated {estimate / 1024 ** 3:.2f} GB; currently free {free_vram / 1024 ** 3:.2f} GB of {total_vram / 1024 ** 3:.2f} GB.', 3, estimated_vram_gb=estimate / 1024 ** 3, free_vram_gb=free_vram / 1024 ** 3)
@@ -298,6 +362,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         emit_progress(progress, 'Base model weights loaded. Starting fresh fine-tune optimizer state.', 8)
     else:
         emit_progress(progress, 'Starting new training run.', 6)
+    model = _try_compile_model(model, training_config.device)
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
@@ -322,14 +387,15 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     tokens_since_metric = 0
     step_time_window: list[float] = []
     for epoch in range(start_epoch, training_config.epochs):
-        epoch_loss_sum: Optional[torch.Tensor] = None
+        epoch_loss_sum = 0.0
         epoch_loss_count = 0
         latest_loss_scalar: Optional[float] = None
+        last_batch_loss: Optional[torch.Tensor] = None
         epoch_batch_count = len(train_loader)
         for batch_index, (x, y) in enumerate(train_loader):
             if should_stop and should_stop():
-                if epoch_loss_sum is not None:
-                    final_train_loss = float((epoch_loss_sum / max(epoch_loss_count, 1)).item())
+                if epoch_loss_count > 0:
+                    final_train_loss = epoch_loss_sum / epoch_loss_count
                 return finish_stopped(epoch, final_train_loss)
             x = x.to(training_config.device, non_blocking=pin_memory)
             y = y.to(training_config.device, non_blocking=pin_memory)
@@ -337,8 +403,7 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                 logits = model(x)
                 loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=pad_token_id)
                 loss = loss / training_config.gradient_accumulation
-            batch_loss = loss.detach() * training_config.gradient_accumulation
-            epoch_loss_sum = batch_loss if epoch_loss_sum is None else epoch_loss_sum + batch_loss
+            last_batch_loss = loss.detach() * training_config.gradient_accumulation
             epoch_loss_count += 1
             samples_since_metric += int(x.shape[0])
             tokens_since_metric += int(x.numel())
@@ -369,7 +434,9 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                     tokens_seen = tokens_since_metric
                     samples_since_metric = 0
                     tokens_since_metric = 0
-                    latest_loss_scalar = float(batch_loss.item())
+                    # Single .item() sync for loss — only at reporting boundaries.
+                    latest_loss_scalar = _gpu_scalar_to_float(last_batch_loss) if last_batch_loss is not None else 0.0
+                    epoch_loss_sum += latest_loss_scalar
                     grad_norm = None
                     weight_norm = None
                     update_ratio = None
@@ -426,12 +493,12 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                     )
                 if val_loader is not None and training_config.eval_interval > 0 and (global_step % training_config.eval_interval == 0):
                     if latest_loss_scalar is None:
-                        latest_loss_scalar = float(batch_loss.item())
+                        latest_loss_scalar = _gpu_scalar_to_float(last_batch_loss) if last_batch_loss is not None else 0.0
                     emit_progress(progress, f'Running validation at step {global_step}...', current_progress, event_type='validation', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=latest_loss_scalar, val_loss=final_val_loss, **_system_metrics(progress))
                     try:
                         final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, current_progress)
                     except TrainingStopRequested:
-                        current_train_loss = float((epoch_loss_sum / max(epoch_loss_count, 1)).item()) if epoch_loss_sum is not None else final_train_loss
+                        current_train_loss = epoch_loss_sum / max(epoch_loss_count, 1) if epoch_loss_count > 0 else final_train_loss
                         return finish_stopped(epoch, current_train_loss)
                     emit_progress(progress, f'Validation loss at step {global_step}: {final_val_loss:.4f}', current_progress, event_type='validation', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=latest_loss_scalar, val_loss=final_val_loss, **_system_metrics(progress))
                     if best_val_loss is None or final_val_loss < best_val_loss:
@@ -452,13 +519,13 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                             early_stopped = True
                             break
                 if training_config.save_interval > 0 and global_step % training_config.save_interval == 0:
-                    checkpoint_train_loss = float((epoch_loss_sum / max(epoch_loss_count, 1)).item()) if epoch_loss_sum is not None else final_train_loss
+                    checkpoint_train_loss = epoch_loss_sum / max(epoch_loss_count, 1) if epoch_loss_count > 0 else final_train_loss
                     save_checkpoint(checkpoints_dir / f'checkpoint_{global_step}.pt', model, optimizer, scheduler, scaler, model_config, training_config, global_step, epoch + 1, checkpoint_train_loss, final_val_loss)
                     emit_progress(progress, f'Saved checkpoint at step {global_step}.', current_progress, event_type='checkpoint')
         if early_stopped:
             break
-        if epoch_loss_sum is not None:
-            final_train_loss = float((epoch_loss_sum / max(epoch_loss_count, 1)).item())
+        if epoch_loss_count > 0:
+            final_train_loss = epoch_loss_sum / epoch_loss_count
         if val_loader is not None:
             try:
                 final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)))

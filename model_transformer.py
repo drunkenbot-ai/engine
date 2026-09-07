@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 from typing import Optional
@@ -194,17 +194,24 @@ class CausalSelfAttention(nn.Module):
     def _expand_kv(self, value: torch.Tensor) -> torch.Tensor:
         """Expand grouped key/value heads to query head count.
 
+        Uses ``expand`` for a zero-copy view instead of
+        ``repeat_interleave`` which allocates a full copy.
+
         Args:
-            value: Key or value tensor with key/value head count.
+            value: Key or value tensor ``[B, kv_heads, T, D]``.
 
         Returns:
-            Tensor with one key/value head per query head.
+            Tensor with shape ``[B, heads, T, D]``.
         """
-
         if self.kv_head_count == self.head_count:
             return value
         repeat_count = self.head_count // self.kv_head_count
-        return value.repeat_interleave(repeat_count, dim=1)
+        batch, kv_heads, seq_len, head_dim = value.shape
+        return (
+            value[:, :, None, :, :]
+            .expand(batch, kv_heads, repeat_count, seq_len, head_dim)
+            .reshape(batch, self.head_count, seq_len, head_dim)
+        )
 
 
 class MLP(nn.Module):

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -231,7 +231,7 @@ class TrainingConfig:
     eval_interval: int = 100
     max_eval_batches: int = 50
     save_interval: int = 500
-    data_loader_workers: int = 0
+    data_loader_workers: int = 2
     max_grad_norm: float = 1.0
     activation_checkpointing: bool = False
     use_amp: bool = True

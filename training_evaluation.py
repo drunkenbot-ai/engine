@@ -1,13 +1,13 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 from .model import MicroGPT
-from .training_resume import _release_cuda_cache
 from .training_runtime import emit_progress, system_cpu_percent, system_ram_percent
 
 
@@ -26,22 +26,33 @@ def evaluate(
     step: Optional[int] = None,
     total_steps: Optional[int] = None,
     percent: Optional[int] = None,
+    use_autocast: bool = False,
+    autocast_dtype: torch.dtype = torch.float32,
 ) -> float:
     """Evaluate validation loss.
+
     Args:
         model: Model to evaluate.
         loader: Validation data loader.
         device: Device used for evaluation.
         pad_token_id: Token ID ignored in loss.
-        max_batches: Maximum validation batches to evaluate. Zero evaluates the full loader.
+        max_batches: Maximum validation batches to evaluate.
+            Zero evaluates the full loader.
         progress: Optional progress callback.
         should_stop: Optional cancellation callback.
         step: Current optimizer step for progress metrics.
         total_steps: Total planned optimizer steps for progress metrics.
         percent: Current outer training progress percentage.
+        use_autocast: Whether to use mixed-precision autocast.
+        autocast_dtype: Datatype for autocast when enabled.
+
     Returns:
         Mean validation loss.
+
+    Raises:
+        TrainingStopRequested: When the user requests a stop.
     """
+    pin_memory = device.startswith("cuda")
     model.eval()
     losses: list[float] = []
     batch_limit = len(loader) if max_batches <= 0 else min(len(loader), max_batches)
@@ -49,19 +60,26 @@ def evaluate(
         for batch_index, (x, y) in enumerate(loader, start=1):
             if should_stop and should_stop():
                 model.train()
-                raise TrainingStopRequested("Training stopped by user during validation.")
+                raise TrainingStopRequested(
+                    "Training stopped by user during validation."
+                )
             if batch_index > batch_limit:
                 break
-            x = x.to(device)
-            y = y.to(device)
-            logits = model(x)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                y.reshape(-1),
-                ignore_index=pad_token_id,
-            )
+            x = x.to(device, non_blocking=pin_memory)
+            y = y.to(device, non_blocking=pin_memory)
+            with autocast("cuda", enabled=use_autocast, dtype=autocast_dtype):
+                logits = model(x)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    y.reshape(-1),
+                    ignore_index=pad_token_id,
+                )
             losses.append(float(loss.item()))
-            if progress and (batch_index == 1 or batch_index == batch_limit or batch_index % 10 == 0):
+            if progress and (
+                batch_index == 1
+                or batch_index == batch_limit
+                or batch_index % 10 == 0
+            ):
                 emit_progress(
                     progress,
                     f"Validation running: batch {batch_index}/{batch_limit}.",
@@ -74,5 +92,4 @@ def evaluate(
                     validation_batches=batch_limit,
                 )
     model.train()
-    _release_cuda_cache()
     return sum(losses) / max(len(losses), 1)

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import json
 import math
 import os
@@ -129,8 +129,9 @@ class TokenDataset(Dataset):
         start = index * self.stride
         end = start + self.context_length + 1
         if self._tokens_np is not None:
-            # Read the slice from the numpy array / memmap and convert to tensor.
-            chunk = torch.from_numpy(np.array(self._tokens_np[start:end], dtype=np.int64))
+            # Read the slice from the numpy array / memmap; asarray avoids
+            # a redundant copy when the backing dtype is already int64.
+            chunk = torch.from_numpy(np.asarray(self._tokens_np[start:end], dtype=np.int64))
         else:
             chunk = self._tokens_tensor[start:end]  # type: ignore[index]
         return chunk[:-1], chunk[1:]
