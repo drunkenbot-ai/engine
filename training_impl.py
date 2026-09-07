@@ -496,7 +496,12 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                         latest_loss_scalar = _gpu_scalar_to_float(last_batch_loss) if last_batch_loss is not None else 0.0
                     emit_progress(progress, f'Running validation at step {global_step}...', current_progress, event_type='validation', epoch=epoch + 1, total_epochs=training_config.epochs, step=global_step, total_steps=total_steps, train_loss=latest_loss_scalar, val_loss=final_val_loss, **_system_metrics(progress))
                     try:
-                        final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, current_progress)
+                        final_val_loss = evaluate(
+                            model, val_loader, training_config.device, pad_token_id,
+                            training_config.max_eval_batches, progress, should_stop,
+                            global_step, total_steps, current_progress,
+                            use_autocast=use_autocast, autocast_dtype=autocast_dtype,
+                        )
                     except TrainingStopRequested:
                         current_train_loss = epoch_loss_sum / max(epoch_loss_count, 1) if epoch_loss_count > 0 else final_train_loss
                         return finish_stopped(epoch, current_train_loss)
@@ -528,7 +533,12 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
             final_train_loss = epoch_loss_sum / epoch_loss_count
         if val_loader is not None:
             try:
-                final_val_loss = evaluate(model, val_loader, training_config.device, pad_token_id, training_config.max_eval_batches, progress, should_stop, global_step, total_steps, 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)))
+                final_val_loss = evaluate(
+                    model, val_loader, training_config.device, pad_token_id,
+                    training_config.max_eval_batches, progress, should_stop,
+                    global_step, total_steps, 8 + int(86 * (epoch + 1) / max(training_config.epochs, 1)),
+                    use_autocast=use_autocast, autocast_dtype=autocast_dtype,
+                )
             except TrainingStopRequested:
                 return finish_stopped(epoch + 1, final_train_loss)
             if best_val_loss is None or final_val_loss < best_val_loss:
