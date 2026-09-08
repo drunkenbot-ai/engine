@@ -491,9 +491,10 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                     step_seconds = max(sample.sampled_at - last_metric_time, 1e-09)
                     last_metric_time = sample.sampled_at
                     average_step_seconds = step_seconds / max(steps_since_metric, 1)
-                    step_time_window.append(average_step_seconds)
-                    step_time_window = step_time_window[-50:]
-                    average_step_seconds = sum(step_time_window) / max(len(step_time_window), 1)
+                    if not (compile_requested and global_step == 1):
+                        step_time_window.append(average_step_seconds)
+                        step_time_window = step_time_window[-50:]
+                    average_step_seconds = sum(step_time_window) / max(len(step_time_window), 1) if step_time_window else average_step_seconds
                     remaining_steps = max(total_steps - global_step, 0)
                     eta_seconds = remaining_steps * average_step_seconds
                     steps_since_metric = 0
@@ -558,6 +559,16 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                         data_loader_workers=loader_workers,
                         sample_text=sample_text,
                     )
+                    milestone_interval = max(1, min(training_config.eval_interval // 5 if training_config.eval_interval > 0 else 25, 25))
+                    if global_step == 1 or global_step % milestone_interval == 0:
+                        speed_tok_s = tokens_seen / step_seconds if step_seconds > 0 else 0.0
+                        emit_progress(
+                            progress,
+                            f"Step {global_step}/{total_steps} (Epoch {epoch + 1}/{training_config.epochs}) — "
+                            f"loss: {latest_loss_scalar:.4f}, speed: {speed_tok_s:.0f} tok/s",
+                            current_progress,
+                            event_type="step",
+                        )
                 if val_loader is not None and training_config.eval_interval > 0 and (global_step % training_config.eval_interval == 0):
                     if latest_loss_scalar is None:
                         latest_loss_scalar = _gpu_scalar_to_float(last_batch_loss) if last_batch_loss is not None else 0.0
