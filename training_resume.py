@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from pathlib import Path
@@ -115,6 +115,7 @@ def _saved_training_default(key: str) -> Any:
         "max_grad_norm": 1.0,
         "precision": "fp16",
         "use_amp": True,
+        "compile_model": False,
         "training_mode": "pretrain",
         "fine_tune_from_checkpoint": None,
     }

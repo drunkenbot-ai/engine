@@ -71,35 +71,68 @@ def _model_weight_norm(model: MicroGPT) -> float:
 def _try_compile_model(
     model: torch.nn.Module,
     device: str,
+    enabled: bool = False,
+    model_config: Optional[ModelConfig] = None,
+    training_config: Optional[TrainingConfig] = None,
 ) -> torch.nn.Module:
-    """Apply ``torch.compile`` when the runtime supports it.
+    """Apply ``torch.compile`` when explicitly enabled and supported.
 
     Only compiles on CUDA devices where kernel fusion provides
-    meaningful throughput gains.  Falls back gracefully on older
-    PyTorch builds or when the Triton compiler is unavailable
-    (common on Windows).
+    meaningful throughput gains. Falls back gracefully on older
+    PyTorch builds, when Triton is unavailable, or when Inductor
+    lowering/backward passes fail.
 
     Args:
         model: Model to compile.
         device: Training device string (e.g. ``"cuda"`` or ``"cpu"``).
+        enabled: Whether compilation is enabled in training config.
+        model_config: Optional model configuration for warm-up.
+        training_config: Optional training configuration for warm-up.
 
     Returns:
-        Compiled model, or the original model on failure.
+        Compiled model, or the original uncompiled model on failure/disabled.
     """
-    if not device.startswith("cuda"):
+    if not enabled:
+        logger.info("torch.compile is disabled (compile_model=False) — running eager model.")
+        return model
+    if not device.startswith("cuda") or not torch.cuda.is_available():
         logger.info("torch.compile skipped on non-CUDA device.")
         return model
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:
         logger.info("torch.compile not available — skipping.")
         return model
+
+    # Disable Inductor inplace_buffers optimization to work around
+    # PyTorch scheduler fusion KeyError bug ('get_fused_node' KeyError during backward pass)
+    try:
+        import torch._inductor.config as inductor_config
+        inductor_config.inplace_buffers = False
+    except Exception:
+        pass
+
     try:
         compiled = compile_fn(model)
-        logger.info("torch.compile applied successfully.")
+        if model_config is not None:
+            ctx_len = min(16, getattr(model_config, "context_length", 16))
+            dummy_x = torch.zeros((1, ctx_len), dtype=torch.long, device=device)
+            use_amp = bool(getattr(training_config, "use_amp", False))
+            precision = getattr(training_config, "precision", "fp16")
+            amp_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+            with autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                dummy_logits = compiled(dummy_x)
+                dummy_loss = dummy_logits.sum()
+            dummy_loss.backward()
+            model.zero_grad(set_to_none=True)
+        logger.info("torch.compile applied and verified successfully.")
         return compiled
     except Exception as exc:  # noqa: BLE001
-        logger.warning("torch.compile failed (%s) — training without it.", exc)
-        return model
+        logger.warning(
+            "torch.compile compilation or warm-up failed (%s) — training without it in eager mode.",
+            exc,
+        )
+        model.zero_grad(set_to_none=True)
+        return getattr(model, "_orig_mod", model)
 
 
 def _gpu_scalar_to_float(tensor: torch.Tensor) -> float:
@@ -362,7 +395,14 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         emit_progress(progress, 'Base model weights loaded. Starting fresh fine-tune optimizer state.', 8)
     else:
         emit_progress(progress, 'Starting new training run.', 6)
-    model = _try_compile_model(model, training_config.device)
+    compile_requested = bool(getattr(training_config, "compile_model", False))
+    model = _try_compile_model(
+        model,
+        training_config.device,
+        enabled=compile_requested,
+        model_config=model_config,
+        training_config=training_config,
+    )
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
@@ -407,7 +447,27 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
             epoch_loss_count += 1
             samples_since_metric += int(x.shape[0])
             tokens_since_metric += int(x.numel())
-            scaler.scale(loss).backward()
+            try:
+                scaler.scale(loss).backward()
+            except Exception as exc:
+                if hasattr(model, "_orig_mod"):
+                    logger.warning(
+                        "Runtime backward error with torch.compile (%s); falling back to eager model.",
+                        exc,
+                    )
+                    model = model._orig_mod
+                    optimizer.zero_grad(set_to_none=True)
+                    with autocast("cuda", enabled=use_autocast, dtype=autocast_dtype):
+                        logits = model(x)
+                        loss = F.cross_entropy(
+                            logits.reshape(-1, logits.size(-1)),
+                            y.reshape(-1),
+                            ignore_index=pad_token_id,
+                        )
+                        loss = loss / training_config.gradient_accumulation
+                    scaler.scale(loss).backward()
+                else:
+                    raise
             should_step = (batch_index + 1) % training_config.gradient_accumulation == 0 or batch_index + 1 == epoch_batch_count
             if should_step:
                 scaler.unscale_(optimizer)

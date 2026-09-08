@@ -234,6 +234,7 @@ class TrainingConfig:
     data_loader_workers: int = 2
     max_grad_norm: float = 1.0
     activation_checkpointing: bool = False
+    compile_model: bool = False
     use_amp: bool = True
     precision: str = "fp16"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
