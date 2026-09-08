@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import shutil
@@ -11,7 +11,7 @@ from .config import ModelConfig, TrainingConfig
 from .data import file_sha256
 from .lineage import read_json, stable_json_hash, utc_timestamp, write_json
 from .resume_checks import _validate_resume_compatibility
-from .tokenizer import PAD_TOKEN, load_tokenizer, token_id, validate_training_tokenizer
+from .tokenizer import EOS_TOKEN, PAD_TOKEN, load_tokenizer, token_id, validate_training_tokenizer
 from .training import TrainingResult, train_model
 
 
@@ -29,6 +29,16 @@ def _load_tokens_for_training(data_dir: Path) -> tuple[Any, Any]:
         val_tokens = json.loads(val_json.read_text(encoding="utf-8"))
         return train_tokens, val_tokens
     raise FileNotFoundError("Prepared dataset is missing token files (expected .npy or .json train/val tokens).")
+
+
+def _load_targets_for_training(data_dir: Path) -> tuple[Optional[Any], Optional[Any]]:
+    train_targets_npy = data_dir / "train_targets.npy"
+    val_targets_npy = data_dir / "val_targets.npy"
+    if train_targets_npy.exists() and val_targets_npy.exists():
+        train_targets = np.load(train_targets_npy, mmap_mode="r", allow_pickle=False)
+        val_targets = np.load(val_targets_npy, mmap_mode="r", allow_pickle=False)
+        return train_targets, val_targets
+    return None, None
 
 
 def train_from_dataset(
@@ -63,6 +73,49 @@ def train_from_dataset(
     tokenizer = load_tokenizer(tokenizer_path)
     validate_training_tokenizer(tokenizer)
     train_tokens, val_tokens = _load_tokens_for_training(data_dir)
+    train_targets, val_targets = _load_targets_for_training(data_dir)
+
+    # If targets are not precomputed but dataset is instruction/conversation tuning,
+    # generate target masks dynamically from corpus.txt if available.
+    if train_targets is None and (
+        dataset_summary.get("dataset_stage") in {"instruction", "conversation", "tool_call"}
+        or training_config.training_mode == "fine_tune"
+    ):
+        corpus_path = data_dir / "corpus.txt"
+        if corpus_path.exists():
+            try:
+                from .target_masking import encode_file_with_targets
+                from .training_core import split_tokens_to_files
+                from .tokenizer import token_dtype_for_vocab
+                if progress:
+                    progress({"message": "Generating prompt loss masks for instruction dataset...", "percent": 3})
+                temp_tokens = data_dir / "temp_tokens.npy"
+                temp_targets = data_dir / "temp_targets.npy"
+                token_dtype = token_dtype_for_vocab(tokenizer.get_vocab_size())
+                encode_file_with_targets(
+                    tokenizer, corpus_path, temp_tokens, temp_targets, token_dtype, should_stop=should_stop
+                )
+                temp_tokens.unlink(missing_ok=True)
+                if temp_targets.exists():
+                    all_targets = np.load(temp_targets, mmap_mode="r")
+                    split_tokens_to_files(
+                        all_targets,
+                        data_dir / "train_targets.npy",
+                        data_dir / "val_targets.npy",
+                        0.1,
+                        dtype=np.dtype(np.int32),
+                        should_stop=should_stop,
+                    )
+                    del all_targets
+                    temp_targets.unlink(missing_ok=True)
+                    if (data_dir / "train_targets.npy").exists():
+                        train_targets = np.load(data_dir / "train_targets.npy", mmap_mode="r", allow_pickle=False)
+                        val_targets = np.load(data_dir / "val_targets.npy", mmap_mode="r", allow_pickle=False)
+            except Exception:
+                pass
+
+    if train_targets is not None and progress:
+        progress({"message": "Prompt loss masking enabled: loss computed strictly on completions.", "percent": 3})
 
     if model_config.vocab_size != tokenizer.get_vocab_size():
         model_config.vocab_size = tokenizer.get_vocab_size()
@@ -76,6 +129,11 @@ def train_from_dataset(
         metadata_path = data_dir / metadata_name
         if metadata_path.exists():
             shutil.copy2(metadata_path, training_config.output_dir / metadata_name)
+    eos_ids: list[int] = [token_id(tokenizer, EOS_TOKEN)]
+    eot_id = tokenizer.token_to_id("<|endoftext|>")
+    if eot_id is not None and eot_id not in eos_ids:
+        eos_ids.append(eot_id)
+
     result = train_model(
         model_config,
         training_config,
@@ -85,6 +143,9 @@ def train_from_dataset(
         progress=progress,
         should_stop=should_stop,
         decode_preview=lambda ids: tokenizer.decode(ids, skip_special_tokens=True),
+        train_targets=train_targets,
+        val_targets=val_targets,
+        eos_token_id=eos_ids,
     )
     training_summary = read_json(result.summary_path, default={}) or {}
     run_id = (

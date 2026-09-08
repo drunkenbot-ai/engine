@@ -54,7 +54,8 @@ def evaluate(
     """
     pin_memory = device.startswith("cuda")
     model.eval()
-    losses: list[float] = []
+    total_loss_sum = 0.0
+    total_valid_tokens = 0
     batch_limit = len(loader) if max_batches <= 0 else min(len(loader), max_batches)
     with torch.no_grad():
         for batch_index, (x, y) in enumerate(loader, start=1):
@@ -69,12 +70,20 @@ def evaluate(
             y = y.to(device, non_blocking=pin_memory)
             with autocast("cuda", enabled=use_autocast, dtype=autocast_dtype):
                 logits = model(x)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    y.reshape(-1),
-                    ignore_index=pad_token_id,
-                )
-            losses.append(float(loss.item()))
+                targets_flat = y.reshape(-1)
+                if pad_token_id is not None and pad_token_id >= 0:
+                    targets_flat = targets_flat.clone()
+                    targets_flat[targets_flat == pad_token_id] = -100
+                valid_mask = (targets_flat != -100)
+                if valid_mask.any():
+                    loss_sum = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        targets_flat,
+                        ignore_index=-100,
+                        reduction="sum",
+                    )
+                    total_loss_sum += float(loss_sum.item())
+                    total_valid_tokens += int(valid_mask.sum().item())
             if progress and (
                 batch_index == 1
                 or batch_index == batch_limit
@@ -92,4 +101,6 @@ def evaluate(
                     validation_batches=batch_limit,
                 )
     model.train()
-    return sum(losses) / max(len(losses), 1)
+    if total_valid_tokens > 0:
+        return total_loss_sum / total_valid_tokens
+    return 0.0

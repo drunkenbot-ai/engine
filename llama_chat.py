@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from threading import Lock
@@ -116,10 +116,17 @@ class LlamaChatSession:
             Assistant reply text.
         """
 
-        effort_instruction = self._effort_instruction(reasoning_effort) if thinking_enabled else self._plain_instruction()
+        system_text = system_prompt.strip()
+        if thinking_enabled and reasoning_effort not in {"None", "none"}:
+            effort_text = self._effort_instruction(reasoning_effort)
+            if effort_text and effort_text not in system_text:
+                system_text = f"{system_text} {effort_text}".strip() if system_text else effort_text
+        elif not system_text and not thinking_enabled:
+            system_text = self._plain_instruction()
+
         messages = []
-        if system_prompt.strip() or effort_instruction:
-            messages.append({"role": "system", "content": "\n".join(part for part in (system_prompt.strip(), effort_instruction) if part)})
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
 
         with self._lock:
             messages.extend(self._messages)
@@ -130,6 +137,7 @@ class LlamaChatSession:
                 temperature=temperature,
                 top_p=top_p,
                 repeat_penalty=repeat_penalty,
+                stop=["\nUser:", "\nSystem:", "\nHuman:", "<|endoftext|>", "<eos>"],
             )
             reply = response["choices"][0]["message"]["content"].strip()
             self._messages.append({"role": "user", "content": prompt})
@@ -167,10 +175,17 @@ class LlamaChatSession:
             Reply text and generation metrics.
         """
 
-        effort_instruction = self._effort_instruction(reasoning_effort) if thinking_enabled else self._plain_instruction()
+        system_text = system_prompt.strip()
+        if thinking_enabled and reasoning_effort not in {"None", "none"}:
+            effort_text = self._effort_instruction(reasoning_effort)
+            if effort_text and effort_text not in system_text:
+                system_text = f"{system_text} {effort_text}".strip() if system_text else effort_text
+        elif not system_text and not thinking_enabled:
+            system_text = self._plain_instruction()
+
         messages = []
-        if system_prompt.strip() or effort_instruction:
-            messages.append({"role": "system", "content": "\n".join(part for part in (system_prompt.strip(), effort_instruction) if part)})
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
 
         started_at = perf_counter()
         reply_parts: list[str] = []
@@ -185,6 +200,7 @@ class LlamaChatSession:
                 top_p=top_p,
                 repeat_penalty=repeat_penalty,
                 stream=True,
+                stop=["\nUser:", "\nSystem:", "\nHuman:", "<|endoftext|>", "<eos>"],
             )
             for chunk in stream:
                 if should_stop and should_stop():

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from threading import Lock
@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from .config import ModelConfig
 from .model import MicroGPT
 from .tokenizer import EOS_TOKEN, load_tokenizer, token_id
+
+STOP_SEQUENCES = ("\nUser:", "\nSystem:", "\nHuman:", "\nAssistant:", "<|endoftext|>", "<eos>")
 
 
 class MicroGPTChatSession:
@@ -119,7 +121,9 @@ class MicroGPTChatSession:
         reply_parts: list[str] = []
         generated_ids: list[int] = []
         with self._lock, torch.no_grad():
-            prompt_text = self._render_prompt(prompt, system_prompt, reasoning_effort, thinking_enabled)
+            prompt_text = self._render_prompt(
+                prompt, system_prompt, reasoning_effort, thinking_enabled, max_tokens=max_tokens
+            )
             input_ids = self.tokenizer.encode(prompt_text).ids[-self.config.context_length :]
             ids = torch.tensor([input_ids], dtype=torch.long, device=self.device)
             emitted_text = ""
@@ -152,8 +156,19 @@ class MicroGPTChatSession:
                 full_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
                 if full_text.endswith("\ufffd"):
                     continue
+
+                stop_hit = None
+                for s in STOP_SEQUENCES:
+                    if s in full_text:
+                        stop_hit = s
+                        break
+                if stop_hit is not None:
+                    break
+
                 piece = full_text[len(emitted_text) :]
                 if not piece:
+                    continue
+                if any(s.startswith(piece) for s in STOP_SEQUENCES):
                     continue
                 emitted_text = full_text
                 reply_parts.append(piece)
@@ -170,12 +185,10 @@ class MicroGPTChatSession:
                     )
 
             reply = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip() if generated_ids else ""
-            # If generation stopped (should_stop or max_tokens) exactly
-            # mid-way through a multi-byte character, the trailing bytes
-            # are incomplete and decode to a replacement character. That's
-            # a truncation artifact, not real content, so trim it rather
-            # than showing it to the user.
-            reply = reply.rstrip("\ufffd")
+            for s in STOP_SEQUENCES:
+                if s in reply:
+                    reply = reply.split(s)[0].strip()
+            reply = reply.rstrip("\ufffd").strip()
             if reply:
                 self._messages.append({"role": "user", "content": prompt})
                 self._messages.append({"role": "assistant", "content": reply})
@@ -188,28 +201,61 @@ class MicroGPTChatSession:
             "stopped": bool(should_stop and should_stop()),
         }
 
-    def _render_prompt(self, prompt: str, system_prompt: str, reasoning_effort: str, thinking_enabled: bool) -> str:
-        """Render chat history into plain text for MicroGPT.
+    def _render_prompt(
+        self,
+        prompt: str,
+        system_prompt: str,
+        reasoning_effort: str,
+        thinking_enabled: bool,
+        max_tokens: int = 512,
+    ) -> str:
+        """Render chat history into plain text for MicroGPT with turn-aware history pruning.
 
         Args:
             prompt: Latest user message.
             system_prompt: Optional system instruction.
             reasoning_effort: Effort mode label.
             thinking_enabled: Whether reasoning guidance is enabled.
+            max_tokens: Maximum new tokens reserved for reply.
 
         Returns:
             Prompt text.
         """
 
-        instruction = self._effort_instruction(reasoning_effort) if thinking_enabled else self._plain_instruction()
+        system_text = system_prompt.strip()
+        if thinking_enabled and reasoning_effort not in {"None", "none"}:
+            effort_text = self._effort_instruction(reasoning_effort)
+            if effort_text and effort_text not in system_text:
+                system_text = f"{system_text} {effort_text}".strip() if system_text else effort_text
+        elif not system_text and not thinking_enabled:
+            system_text = self._plain_instruction()
+
         parts = []
-        if system_prompt.strip() or instruction:
-            parts.append(f"System: {' '.join(part for part in (system_prompt.strip(), instruction) if part)}")
-        for message in self._messages[-12:]:
+        if system_text:
+            parts.append(f"System: {system_text}")
+
+        latest_turn = f"User: {prompt}\nAssistant:"
+
+        # Calculate token budget available for conversation history
+        prefix_ids = self.tokenizer.encode("\n".join(parts) + ("\n" if parts else "")).ids
+        suffix_ids = self.tokenizer.encode("\n" + latest_turn).ids
+        overhead = len(prefix_ids) + len(suffix_ids)
+        available_budget = max(0, self.config.context_length - max_tokens - overhead - 4)
+
+        # Walk history backwards, taking complete turns while budget allows
+        history_parts: list[str] = []
+        total_hist_tokens = 0
+        for message in reversed(self._messages):
             role = "User" if message["role"] == "user" else "Assistant"
-            parts.append(f"{role}: {message['content']}")
-        parts.append(f"User: {prompt}")
-        parts.append("Assistant:")
+            line = f"{role}: {message['content']}"
+            line_tokens = len(self.tokenizer.encode(line + "\n").ids)
+            if total_hist_tokens + line_tokens > available_budget:
+                break
+            history_parts.insert(0, line)
+            total_hist_tokens += line_tokens
+
+        parts.extend(history_parts)
+        parts.append(latest_turn)
         return "\n".join(parts)
 
     def _apply_repeat_penalty(self, logits: torch.Tensor, generated_ids: list[int], repeat_penalty: float) -> torch.Tensor:

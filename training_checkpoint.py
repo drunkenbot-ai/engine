@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal, Optional
@@ -71,13 +71,10 @@ def save_checkpoint(
                 "scaler_state_dict": scaler.state_dict(),
             }
         )
+    if training_config.fine_tune_from_checkpoint:
+        payload["fine_tune_base_checkpoint"] = str(training_config.fine_tune_from_checkpoint)
     if training_config.peft_method == "lora" and artifact_type in {"resume", "adapter"}:
         payload["adapter_state_dict"] = lora_state_dict(model)
-        payload["fine_tune_base_checkpoint"] = (
-            str(training_config.fine_tune_from_checkpoint)
-            if training_config.fine_tune_from_checkpoint
-            else None
-        )
         payload["lora_config"] = {
             "rank": training_config.lora_rank,
             "alpha": training_config.lora_alpha,

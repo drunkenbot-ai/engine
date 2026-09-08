@@ -14,6 +14,7 @@ from .dataset_mixture import MAX_REPETITIVE_UNIT_RATIO
 from .dataset_quality import _dataset_quality_report
 from .dataset_tokenizer import _load_or_create_tokenizer
 from .lineage import record_dataset_version, write_json
+from .target_masking import encode_file_with_targets
 from .tokenizer import encode_file_to_npy, save_tokenizer_package, \
     token_dtype_for_vocab, validate_training_tokenizer
 
@@ -322,10 +323,18 @@ def build_dataset(
     # never holds the full token stream in RAM.
     token_dtype = token_dtype_for_vocab(tokenizer.get_vocab_size())
     all_tokens_path = config.output_dir / "all_tokens.npy"
-    token_count = encode_file_to_npy(
-        tokenizer, corpus_path, all_tokens_path, token_dtype,
-        should_stop=should_stop
-    )
+    all_targets_path = config.output_dir / "all_targets.npy"
+    has_instruction_data = config.dataset_stage in {"instruction", "conversation", "tool_call"} or stats.conversation_sample_count > 0
+    if has_instruction_data:
+        token_count = encode_file_with_targets(
+            tokenizer, corpus_path, all_tokens_path, all_targets_path, token_dtype,
+            should_stop=should_stop,
+        )
+    else:
+        token_count = encode_file_to_npy(
+            tokenizer, corpus_path, all_tokens_path, token_dtype,
+            should_stop=should_stop,
+        )
     _emit(progress, f"Encoded {token_count:,} tokens.", 86)
 
     token_density = (token_count / max(character_count,
@@ -357,14 +366,30 @@ def build_dataset(
     if should_stop and should_stop():
         raise RuntimeError("Dataset preparation stopped by user.")
     all_tokens = np.load(all_tokens_path, mmap_mode="r")
-    train_token_count, val_token_count = split_tokens_to_files(
-        all_tokens,
-        config.output_dir / "train_tokens.npy",
-        config.output_dir / "val_tokens.npy",
-        config.validation_split,
-        dtype=token_dtype,
-        should_stop=should_stop,
-    )
+    if has_instruction_data and all_targets_path.exists():
+        all_targets = np.load(all_targets_path, mmap_mode="r")
+        train_token_count, val_token_count = split_tokens_to_files(
+            all_tokens,
+            config.output_dir / "train_tokens.npy",
+            config.output_dir / "val_tokens.npy",
+            config.validation_split,
+            dtype=token_dtype,
+            should_stop=should_stop,
+            targets=all_targets,
+            train_targets_path=config.output_dir / "train_targets.npy",
+            val_targets_path=config.output_dir / "val_targets.npy",
+        )
+        del all_targets
+        all_targets_path.unlink(missing_ok=True)
+    else:
+        train_token_count, val_token_count = split_tokens_to_files(
+            all_tokens,
+            config.output_dir / "train_tokens.npy",
+            config.output_dir / "val_tokens.npy",
+            config.validation_split,
+            dtype=token_dtype,
+            should_stop=should_stop,
+        )
     del all_tokens  # release the memmap handle before deleting the backing file
     all_tokens_path.unlink(missing_ok=True)
     train_window_count = max(0, train_token_count - config.context_length)
@@ -411,6 +436,7 @@ def build_dataset(
         "val_token_count": val_token_count,
         "train_tokens_path": "train_tokens.npy",
         "val_tokens_path": "val_tokens.npy",
+        "prompt_loss_masking": bool(has_instruction_data),
         "token_storage_format": "npy",
         "train_window_count": train_window_count,
         "val_window_count": val_window_count,

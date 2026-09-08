@@ -5,7 +5,7 @@ import logging
 import math
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -251,7 +251,19 @@ def _save_best_validation_artifacts(
     )
     return best_path, best_path
 
-def train_model(model_config: ModelConfig, training_config: TrainingConfig, train_tokens: Union[list[int], np.ndarray], val_tokens: Union[list[int], np.ndarray], pad_token_id: int, progress: Optional[Callable[[Any], None]]=None, should_stop: Optional[Callable[[], bool]]=None, decode_preview: Optional[Callable[[list[int]], str]]=None) -> TrainingResult:
+def train_model(
+    model_config: ModelConfig,
+    training_config: TrainingConfig,
+    train_tokens: Union[list[int], np.ndarray],
+    val_tokens: Union[list[int], np.ndarray],
+    pad_token_id: int,
+    progress: Optional[Callable[[Any], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    decode_preview: Optional[Callable[[list[int]], str]] = None,
+    train_targets: Optional[Union[list[int], np.ndarray]] = None,
+    val_targets: Optional[Union[list[int], np.ndarray]] = None,
+    eos_token_id: Union[int, Sequence[int]] = 1,
+) -> TrainingResult:
     """Train a MicroGPT model.
     Args:
         model_config: Architecture settings.
@@ -262,6 +274,9 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         progress: Optional callback receiving progress dictionaries.
         should_stop: Optional callback returning true when training should stop.
         decode_preview: Optional callback that decodes token IDs into a short text preview.
+        train_targets: Optional parallel targets stream with prompt tokens masked to -100.
+        val_targets: Optional parallel validation targets stream with prompt tokens masked to -100.
+        eos_token_id: Token ID marking the end of a document/sample.
     Returns:
         Training result with checkpoint and summary paths.
     """
@@ -290,17 +305,89 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     loader_workers = max(0, int(training_config.data_loader_workers))
     pin_memory = training_config.device.startswith('cuda') and torch.cuda.is_available()
     loader_kwargs = {'num_workers': loader_workers, 'pin_memory': pin_memory, 'persistent_workers': loader_workers > 0}
-    train_loader = DataLoader(TokenDataset(train_tokens, model_config.context_length, stride=training_config.sample_stride), batch_size=training_config.batch_size, shuffle=True, drop_last=True, **loader_kwargs)
+
+    is_instruction_tuning = (
+        training_config.training_mode == "fine_tune"
+        and train_targets is not None
+    )
+    if is_instruction_tuning:
+        from .target_masking import InstructionDataset, collate_instruction_batch
+        train_ds = InstructionDataset(
+            train_tokens,
+            targets=train_targets,
+            context_length=model_config.context_length,
+            eos_token_id=eos_token_id,
+        )
+        if len(train_ds) > 0:
+            emit_progress(progress, f'Discrete sample dataset active: {len(train_ds):,} instruction sample(s).', 4)
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=training_config.batch_size,
+                shuffle=True,
+                drop_last=len(train_ds) > training_config.batch_size,
+                collate_fn=lambda b: collate_instruction_batch(b, pad_token_id),
+                **loader_kwargs,
+            )
+        else:
+            train_loader = DataLoader(
+                TokenDataset(
+                    train_tokens,
+                    model_config.context_length,
+                    stride=training_config.sample_stride,
+                    targets=train_targets,
+                ),
+                batch_size=training_config.batch_size,
+                shuffle=True,
+                drop_last=True,
+                **loader_kwargs,
+            )
+    else:
+        train_loader = DataLoader(
+            TokenDataset(
+                train_tokens,
+                model_config.context_length,
+                stride=training_config.sample_stride,
+                targets=train_targets,
+            ),
+            batch_size=training_config.batch_size,
+            shuffle=True,
+            drop_last=True,
+            **loader_kwargs,
+        )
+
     val_loader = None
-    if len(val_tokens) > model_config.context_length:
+    if is_instruction_tuning and val_tokens is not None and len(val_tokens) >= 2:
+        from .target_masking import InstructionDataset, collate_instruction_batch
+        val_ds = InstructionDataset(
+            val_tokens,
+            targets=val_targets,
+            context_length=model_config.context_length,
+            eos_token_id=eos_token_id,
+        )
+        if len(val_ds) > 0:
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=training_config.batch_size,
+                shuffle=False,
+                drop_last=False,
+                collate_fn=lambda b: collate_instruction_batch(b, pad_token_id),
+                **loader_kwargs,
+            )
+    elif len(val_tokens) > model_config.context_length:
         val_stride = max(1, model_config.context_length)
         val_loader = DataLoader(
-            TokenDataset(val_tokens, model_config.context_length, stride=val_stride),
+            TokenDataset(
+                val_tokens,
+                model_config.context_length,
+                stride=val_stride,
+                targets=val_targets,
+            ),
             batch_size=training_config.batch_size,
             shuffle=False,
             drop_last=False,
             **loader_kwargs,
         )
+
     global_step = 0
     start_epoch = 0
     final_train_loss = 0.0
@@ -315,24 +402,37 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
         resume_path = latest_checkpoint(checkpoints_dir)
     resume_checkpoint: Optional[dict[str, Any]] = None
     resume_compatibility: Optional[ResumeCompatibilityReport] = None
-    if training_config.peft_method == 'lora':
+
+    if training_config.training_mode == 'fine_tune':
         base_path = training_config.fine_tune_from_checkpoint
         if resume_path and Path(resume_path).exists():
             resume_checkpoint = torch.load(resume_path, map_location='cpu')
             checkpoint_base = resume_checkpoint.get('fine_tune_base_checkpoint')
             if checkpoint_base:
                 base_path = Path(checkpoint_base)
-        if base_path is None:
+        if base_path is None and training_config.peft_method == 'lora':
             raise ValueError('LoRA fine-tuning requires a base checkpoint.')
-        base_path = Path(base_path)
-        if not base_path.exists():
-            raise FileNotFoundError(f'LoRA base checkpoint not found: {base_path}')
-        emit_progress(progress, f'Loading LoRA base checkpoint: {base_path}', 5)
-        base_checkpoint = torch.load(base_path, map_location='cpu')
-        model.load_state_dict(base_checkpoint['model_state_dict'])
-        wrapped = apply_lora_adapters(model, training_config.lora_rank, training_config.lora_alpha, training_config.lora_dropout, training_config.lora_target_modules)
-        freeze_non_lora_parameters(model)
-        emit_progress(progress, f'LoRA enabled: {wrapped} module(s), {lora_parameter_count(model):,} trainable adapter parameter(s).', 6)
+        if base_path is not None:
+            base_path = Path(base_path)
+            if not base_path.exists():
+                raise FileNotFoundError(f'Fine-tune base checkpoint not found: {base_path}')
+            emit_progress(progress, f'Loading base checkpoint: {base_path}', 5)
+            compatibility = check_resume_compatibility(base_path, model_config, training_config)
+            for line in compatibility.info:
+                emit_progress(progress, line, 5)
+            for line in compatibility.warnings:
+                emit_progress(progress, f'[WARN] {line}', 5, event_type='warning')
+            if compatibility.errors:
+                message = 'Fine-tune base checkpoint is not compatible with the current model settings:\n' + '\n'.join((f'- {line}' for line in compatibility.errors))
+                raise ValueError(message)
+            base_checkpoint = torch.load(base_path, map_location='cpu')
+            model.load_state_dict(base_checkpoint['model_state_dict'])
+        if training_config.peft_method == 'lora':
+            wrapped = apply_lora_adapters(model, training_config.lora_rank, training_config.lora_alpha, training_config.lora_dropout, training_config.lora_target_modules)
+            freeze_non_lora_parameters(model)
+            emit_progress(progress, f'LoRA enabled: {wrapped} module(s), {lora_parameter_count(model):,} trainable adapter parameter(s).', 6)
+        else:
+            emit_progress(progress, f'Full fine-tune initialized from base weights: all {sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters trainable.', 6)
     optimizer = make_optimizer(model, training_config)
     steps_per_epoch = max(math.ceil(len(train_loader) / training_config.gradient_accumulation), 1)
     total_steps = max(steps_per_epoch * training_config.epochs, 1)
@@ -384,24 +484,10 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         emit_progress(progress, f'Checkpoint loaded at step {global_step}.', 8)
         _release_cuda_cache()
-    elif training_config.training_mode == 'fine_tune' and training_config.fine_tune_from_checkpoint is not None and (training_config.peft_method != 'lora'):
-        base_path = Path(training_config.fine_tune_from_checkpoint)
-        if not base_path.exists():
-            raise FileNotFoundError(f'Fine-tune base checkpoint not found: {base_path}')
-        emit_progress(progress, f'Fine-tuning from base checkpoint: {base_path}', 6)
-        compatibility = check_resume_compatibility(base_path, model_config, training_config)
-        for line in compatibility.info:
-            emit_progress(progress, line, 6)
-        for line in compatibility.warnings:
-            emit_progress(progress, f'[WARN] {line}', 6, event_type='warning')
-        if compatibility.errors:
-            message = 'Fine-tune base checkpoint is not compatible with the current model settings:\n' + '\n'.join((f'- {line}' for line in compatibility.errors))
-            raise ValueError(message)
-        checkpoint = torch.load(base_path, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        emit_progress(progress, 'Base model weights loaded. Starting fresh fine-tune optimizer state.', 8)
+    elif training_config.training_mode == 'fine_tune':
+        emit_progress(progress, 'Starting fresh fine-tune run from base model weights.', 8)
     else:
-        emit_progress(progress, 'Starting new training run.', 6)
+        emit_progress(progress, 'Starting fresh pretraining run from random weights.', 8)
     compile_requested = bool(getattr(training_config, "compile_model", False))
     model = _try_compile_model(
         model,
@@ -448,7 +534,15 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
             y = y.to(training_config.device, non_blocking=pin_memory)
             with autocast('cuda', enabled=use_autocast, dtype=autocast_dtype):
                 logits = model(x)
-                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=pad_token_id)
+                targets_flat = y.reshape(-1)
+                if pad_token_id is not None and pad_token_id >= 0:
+                    targets_flat = targets_flat.clone()
+                    targets_flat[targets_flat == pad_token_id] = -100
+                valid_mask = (targets_flat != -100)
+                if valid_mask.any():
+                    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets_flat, ignore_index=-100)
+                else:
+                    loss = logits.sum() * 0.0
                 loss = loss / training_config.gradient_accumulation
             last_batch_loss = loss.detach() * training_config.gradient_accumulation
             epoch_loss_count += 1
@@ -466,11 +560,19 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
                     optimizer.zero_grad(set_to_none=True)
                     with autocast("cuda", enabled=use_autocast, dtype=autocast_dtype):
                         logits = model(x)
-                        loss = F.cross_entropy(
-                            logits.reshape(-1, logits.size(-1)),
-                            y.reshape(-1),
-                            ignore_index=pad_token_id,
-                        )
+                        targets_flat = y.reshape(-1)
+                        if pad_token_id is not None and pad_token_id >= 0:
+                            targets_flat = targets_flat.clone()
+                            targets_flat[targets_flat == pad_token_id] = -100
+                        valid_mask = (targets_flat != -100)
+                        if valid_mask.any():
+                            loss = F.cross_entropy(
+                                logits.reshape(-1, logits.size(-1)),
+                                targets_flat,
+                                ignore_index=-100,
+                            )
+                        else:
+                            loss = logits.sum() * 0.0
                         loss = loss / training_config.gradient_accumulation
                     scaler.scale(loss).backward()
                 else:

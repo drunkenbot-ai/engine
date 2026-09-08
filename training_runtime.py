@@ -87,16 +87,24 @@ class TokenDataset(Dataset):
     Accepts a list of ints, a numpy array, or a numpy memmap.  When backed by a
     memmap the full token stream lives on disk - only individual windows are
     loaded into RAM on each ``__getitem__`` call, so datasets of any size can be
-    used without exhausting system memory.
+    used without exhausting system memory.  If ``targets`` is provided, targets
+    are drawn from ``targets`` (enabling prompt masking where prompt targets are -100).
     """
-    def __init__(self, tokens: Union[list[int], np.ndarray], context_length: int, stride: int = 1) -> None:
+    def __init__(
+        self,
+        tokens: Union[list[int], np.ndarray],
+        context_length: int,
+        stride: int = 1,
+        targets: Optional[Union[list[int], np.ndarray]] = None,
+    ) -> None:
         """Create a token dataset.
         Args:
             tokens: Complete token stream (list, ndarray, or memmap).
             context_length: Number of input tokens per sample.
             stride: Token offset step between consecutive windows.
+            targets: Optional parallel target stream (list, ndarray, or memmap).
         Raises:
-            ValueError: If there are not enough tokens.
+            ValueError: If there are not enough tokens or length mismatch.
         """
         if len(tokens) <= context_length:
             raise ValueError("Not enough tokens for the selected context length")
@@ -109,6 +117,20 @@ class TokenDataset(Dataset):
         else:
             self._tokens_np = None
             self._tokens_tensor = torch.tensor(tokens, dtype=torch.long)
+
+        if targets is not None:
+            if len(targets) != len(tokens):
+                raise ValueError("tokens and targets must have the same length")
+            if isinstance(targets, np.ndarray):
+                self._targets_np: Optional[np.ndarray] = targets
+                self._targets_tensor: Optional[torch.Tensor] = None
+            else:
+                self._targets_np = None
+                self._targets_tensor = torch.tensor(targets, dtype=torch.long)
+        else:
+            self._targets_np = None
+            self._targets_tensor = None
+
         self.context_length = context_length
         self.stride = stride
         available_windows = len(tokens) - self.context_length
@@ -134,6 +156,13 @@ class TokenDataset(Dataset):
             chunk = torch.from_numpy(np.asarray(self._tokens_np[start:end], dtype=np.int64))
         else:
             chunk = self._tokens_tensor[start:end]  # type: ignore[index]
+
+        if self._targets_np is not None:
+            target_chunk = torch.from_numpy(np.asarray(self._targets_np[start:end], dtype=np.int64))
+            return chunk[:-1], target_chunk[1:]
+        if self._targets_tensor is not None:
+            return chunk[:-1], self._targets_tensor[start:end][1:]  # type: ignore[index]
+
         return chunk[:-1], chunk[1:]
 @dataclass
 class TrainingResult:
@@ -248,14 +277,19 @@ def split_tokens_to_files(
     chunk_size: int = 2048,
     seed: int = 1337,
     should_stop: Optional[Callable[[], bool]] = None,
+    targets: Optional[np.memmap] = None,
+    train_targets_path: Optional[Path] = None,
+    val_targets_path: Optional[Path] = None,
+    targets_dtype: np.dtype = np.dtype(np.int32),
 ) -> tuple[int, int]:
-    """Split a token stream into train/validation ``.npy`` files on disk.
+    """Split a token stream (and optional target stream) into train/validation ``.npy`` files on disk.
     Behaves like :func:`split_tokens` (same chunked, seeded shuffle so
     validation samples are drawn from across the corpus, not just the tail),
     but never materializes the full train or validation token stream in
     memory. ``tokens`` is expected to be a read-only memmap (or any
     ``__len__``/slice-able array) backed by disk; each chunk is read, cast to
-    ``dtype``, and written straight to the appropriate output file. Peak
+    ``dtype``, and written straight to the appropriate output file. If ``targets``
+    is provided, it is split with the exact same chunk assignments. Peak
     memory use is therefore bounded by ``chunk_size`` regardless of corpus
     size.
     Args:
@@ -269,6 +303,10 @@ def split_tokens_to_files(
         seed: Fixed seed for reproducible train/validation assignment.
         should_stop: Optional callback returning true when the split should
             stop early.
+        targets: Optional parallel target stream (e.g. masked prompt targets).
+        train_targets_path: Destination path for training targets ``.npy`` file.
+        val_targets_path: Destination path for validation targets ``.npy`` file.
+        targets_dtype: Signed integer dtype to store targets as (np.int32).
     Returns:
         Pair of ``(train_token_count, val_token_count)``.
     Raises:
@@ -316,17 +354,51 @@ def split_tokens_to_files(
         "fortran_order": False,
         "shape": (val_token_count,),
     }
+
+    has_targets = targets is not None and train_targets_path is not None and val_targets_path is not None
+    if has_targets:
+        train_targets_path.parent.mkdir(parents=True, exist_ok=True)
+        val_targets_path.parent.mkdir(parents=True, exist_ok=True)
+        train_targ_header = {
+            "descr": npy_format.dtype_to_descr(np.dtype(targets_dtype)),
+            "fortran_order": False,
+            "shape": (train_token_count,),
+        }
+        val_targ_header = {
+            "descr": npy_format.dtype_to_descr(np.dtype(targets_dtype)),
+            "fortran_order": False,
+            "shape": (val_token_count,),
+        }
+
     with train_path.open("wb") as train_file, val_path.open("wb") as val_file:
         npy_format.write_array_header_1_0(train_file, train_header)
         npy_format.write_array_header_1_0(val_file, val_header)
-        for chunk_index, (start, end) in enumerate(chunk_ranges):
-            if should_stop and should_stop():
-                raise RuntimeError("Dataset preparation stopped by user.")
-            piece = np.asarray(tokens[start:end], dtype=dtype)
-            if chunk_index in val_chunk_indices:
-                piece.tofile(val_file)
-            else:
-                piece.tofile(train_file)
+
+        if has_targets:
+            with train_targets_path.open("wb") as train_targ_file, val_targets_path.open("wb") as val_targ_file:
+                npy_format.write_array_header_1_0(train_targ_file, train_targ_header)
+                npy_format.write_array_header_1_0(val_targ_file, val_targ_header)
+                for chunk_index, (start, end) in enumerate(chunk_ranges):
+                    if should_stop and should_stop():
+                        raise RuntimeError("Dataset preparation stopped by user.")
+                    piece = np.asarray(tokens[start:end], dtype=dtype)
+                    targ_piece = np.asarray(targets[start:end], dtype=targets_dtype)
+                    if chunk_index in val_chunk_indices:
+                        piece.tofile(val_file)
+                        targ_piece.tofile(val_targ_file)
+                    else:
+                        piece.tofile(train_file)
+                        targ_piece.tofile(train_targ_file)
+        else:
+            for chunk_index, (start, end) in enumerate(chunk_ranges):
+                if should_stop and should_stop():
+                    raise RuntimeError("Dataset preparation stopped by user.")
+                piece = np.asarray(tokens[start:end], dtype=dtype)
+                if chunk_index in val_chunk_indices:
+                    piece.tofile(val_file)
+                else:
+                    piece.tofile(train_file)
+
     return train_token_count, val_token_count
 def make_optimizer(model: MicroGPT, training_config: TrainingConfig) -> torch.optim.Optimizer:
     """Create the configured optimizer.
@@ -403,7 +475,7 @@ def amp_settings(training_config: TrainingConfig) -> tuple[bool, bool, torch.dty
     Returns:
         Tuple of ``use_autocast``, ``use_scaler``, and autocast dtype.
     """
-    use_cuda_amp = training_config.use_amp and training_config.device == "cuda"
+    use_cuda_amp = training_config.use_amp and training_config.device.startswith("cuda")
     if not use_cuda_amp or training_config.precision == "fp32":
         return False, False, torch.float32
     if training_config.precision == "bf16":
