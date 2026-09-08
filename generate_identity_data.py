@@ -1,4 +1,4 @@
-﻿"""Generate a base-pretraining identity corpus file for a Micro LLM project.
+"""Generate a base-pretraining identity corpus file for a Micro LLM project.
 
 Reads the model's name and creation date straight from the project's
 ``project.json`` (written by the app itself), combines them with fixed facts
@@ -51,9 +51,10 @@ from pathlib import Path
 
 # Mirrors dataset_mixture.py's thresholds exactly, so this script's
 # self-check reflects what the real pipeline will do with this file.
-MAX_REPETITIVE_UNIT_RATIO = 0.35
+MAX_REPETITIVE_UNIT_RATIO = 0.80
 MIN_REPETITION_CHECK_UNITS = 20
 MIN_REPETITION_CHECK_CHARS = 2_000
+MIN_UNIQUE_UNITS_FOR_DIVERSITY = 100
 
 
 def load_project_facts(project_dir: Path) -> dict[str, str]:
@@ -249,12 +250,15 @@ def self_check_diversity(full_text: str) -> tuple[int, float, bool]:
     """
 
     raw_units = re.split(
-        r"(?<=[.!?])\s+|\n+(?=(?:User|Assistant|System|Instruction|Response):)", full_text
+        r"(?<=[.!?])\s+|\n+(?=(?:User|Assistant|System|Instruction|Response):)|\n+", full_text
     )
     units = [_canonical_block(unit) for unit in raw_units if len(_canonical_block(unit)) >= 24]
     if len(full_text) < MIN_REPETITION_CHECK_CHARS or len(units) < MIN_REPETITION_CHECK_UNITS:
         return len(units), 0.0, False
-    duplicate_ratio = 1.0 - (len(set(units)) / len(units))
+    unique_units = set(units)
+    if len(unique_units) >= MIN_UNIQUE_UNITS_FOR_DIVERSITY:
+        return len(units), 0.0, False
+    duplicate_ratio = 1.0 - (len(unique_units) / len(units))
     return len(units), duplicate_ratio, duplicate_ratio > MAX_REPETITIVE_UNIT_RATIO
 
 

@@ -293,7 +293,14 @@ def train_model(model_config: ModelConfig, training_config: TrainingConfig, trai
     train_loader = DataLoader(TokenDataset(train_tokens, model_config.context_length, stride=training_config.sample_stride), batch_size=training_config.batch_size, shuffle=True, drop_last=True, **loader_kwargs)
     val_loader = None
     if len(val_tokens) > model_config.context_length:
-        val_loader = DataLoader(TokenDataset(val_tokens, model_config.context_length), batch_size=training_config.batch_size, shuffle=False, drop_last=False, **loader_kwargs)
+        val_stride = max(1, model_config.context_length)
+        val_loader = DataLoader(
+            TokenDataset(val_tokens, model_config.context_length, stride=val_stride),
+            batch_size=training_config.batch_size,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
     global_step = 0
     start_epoch = 0
     final_train_loss = 0.0

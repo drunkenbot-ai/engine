@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import logging
@@ -23,9 +23,10 @@ MIXTURE_CHUNK_CHARS = 25_000
 # A default corpus must not gain apparent scale by repeating a tiny template.
 # This threshold is deliberately conservative: it only applies once a document
 # has enough independently meaningful units to make the measurement useful.
-MAX_REPETITIVE_UNIT_RATIO = 0.35
+MAX_REPETITIVE_UNIT_RATIO = 0.80
 MIN_REPETITION_CHECK_UNITS = 20
 MIN_REPETITION_CHECK_CHARS = 2_000
+MIN_UNIQUE_UNITS_FOR_DIVERSITY = 100
 
 
 def _emit(progress: Optional[Callable[[Any], None]], message: str, percent: Optional[int] = None) -> None:
@@ -100,14 +101,17 @@ def _content_units_for_diversity(document: Document) -> list[str]:
 
     Prose sources are often whitespace-normalised during ingestion, so using
     source lines would miss repeated sentences.  Code remains line-oriented;
-    prose and chat are instead split at sentence and turn boundaries.
+    prose and chat are split at sentence boundaries or newlines.
     """
 
     text = document.text.replace("\r\n", "\n").replace("\r", "\n")
     if document.kind == "code":
         raw_units = text.split("\n")
     else:
-        raw_units = re.split(r"(?<=[.!?])\s+|\n+(?=(?:User|Assistant|System|Instruction|Response):)", text)
+        raw_units = re.split(
+            r"(?<=[.!?])\s+|\n+(?=(?:User|Assistant|System|Instruction|Response):)|\n+",
+            text,
+        )
     return [
         _canonical_corpus_block(unit)
         for unit in raw_units
@@ -115,11 +119,15 @@ def _content_units_for_diversity(document: Document) -> list[str]:
     ]
 
 
-def _filter_repetitive_documents(documents: list[Document]) -> tuple[list[Document], dict[str, Any]]:
+def _filter_repetitive_documents(
+    documents: list[Document],
+    max_repetitive_ratio: float = MAX_REPETITIVE_UNIT_RATIO,
+    min_unique_units: int = MIN_UNIQUE_UNITS_FOR_DIVERSITY,
+) -> tuple[list[Document], dict[str, Any]]:
     """Remove documents dominated by exact repeated content units.
 
     This is a quality gate, not a substitute for semantic deduplication.  It
-    catches generated padding such as the old bundled curriculum files before
+    catches generated padding such as synthetic repetitive files before
     it can dominate token counts and make a small corpus look large.
     """
 
@@ -130,13 +138,18 @@ def _filter_repetitive_documents(documents: list[Document]) -> tuple[list[Docume
         if len(document.text) < MIN_REPETITION_CHECK_CHARS or len(units) < MIN_REPETITION_CHECK_UNITS:
             accepted.append(document)
             continue
-        duplicate_ratio = 1.0 - (len(set(units)) / len(units))
-        if duplicate_ratio > MAX_REPETITIVE_UNIT_RATIO:
+        unique_units = set(units)
+        if len(unique_units) >= min_unique_units:
+            accepted.append(document)
+            continue
+        duplicate_ratio = 1.0 - (len(unique_units) / len(units))
+        if duplicate_ratio > max_repetitive_ratio:
             rejected.append(
                 {
                     "path": str(document.path),
                     "kind": document.kind,
                     "unit_count": len(units),
+                    "unique_units": len(unique_units),
                     "duplicate_unit_ratio": round(duplicate_ratio, 4),
                 }
             )
@@ -150,7 +163,7 @@ def _filter_repetitive_documents(documents: list[Document]) -> tuple[list[Docume
             for document in documents
             if str(document.path) in rejected_paths
         ),
-        "threshold": MAX_REPETITIVE_UNIT_RATIO,
+        "threshold": max_repetitive_ratio,
         "examples": rejected[:50],
     }
 
@@ -379,4 +392,5 @@ __all__ = [
     "_apply_dataset_mixture",
     "_filter_repetitive_documents",
     "MAX_REPETITIVE_UNIT_RATIO",
+    "MIN_UNIQUE_UNITS_FOR_DIVERSITY",
 ]

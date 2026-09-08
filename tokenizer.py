@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -28,7 +28,7 @@ MAX_TOKENIZER_LINE_CHARS = 8_192
 # evenly-spread sample of the corpus is shown to the trainer. The full
 # corpus is still encoded with the resulting tokenizer afterward -- only
 # *training* the merges is sampled.
-DEFAULT_TOKENIZER_TRAINING_MAX_BYTES = 2 * 1024 * 1024 * 1024  * 1024 * 1024 * 1024 # 12 GiB
+DEFAULT_TOKENIZER_TRAINING_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 TOKENIZER_SAMPLE_SEED = 1337
 # Tokens are streamed to disk in fixed-size batches rather than accumulated
 # into one giant Python list, so peak RAM during encoding stays roughly
@@ -257,7 +257,7 @@ def encode_text(tokenizer: Tokenizer, text: str) -> list[int]:
     for start in range(0, len(text), MAX_TOKENIZER_LINE_CHARS):
         chunk = text[start : start + MAX_TOKENIZER_LINE_CHARS]
         if chunk:
-            token_ids.extend(tokenizer.encode(chunk).ids)
+            token_ids.extend(tokenizer.encode(chunk, add_special_tokens=False).ids)
     return token_ids
 
 
@@ -288,7 +288,7 @@ def encode_file(
             for start in range(0, len(line), MAX_TOKENIZER_LINE_CHARS):
                 chunk = line[start : start + MAX_TOKENIZER_LINE_CHARS]
                 if chunk:
-                    token_ids.extend(tokenizer.encode(chunk).ids)
+                    token_ids.extend(tokenizer.encode(chunk, add_special_tokens=False).ids)
     return token_ids
 
 
@@ -353,7 +353,7 @@ def encode_file_to_bin(
 
         nonlocal total_tokens
         if pending_chunks:
-            for encoding in tokenizer.encode_batch(pending_chunks):
+            for encoding in tokenizer.encode_batch(pending_chunks, add_special_tokens=False):
                 buffer.extend(encoding.ids)
             pending_chunks.clear()
         if len(buffer) >= ENCODE_FLUSH_TOKEN_COUNT:

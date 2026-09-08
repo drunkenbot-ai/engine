@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 import statistics
@@ -186,6 +186,7 @@ def build_dataset(
         code_training_mode=config.code_training_mode,
         generate_instruction_samples=config.generate_instruction_samples,
         reasoning_sample_mode=config.reasoning_sample_mode,
+        filter_low_diversity=config.filter_low_diversity,
     )
     # Loading, exact-duplicate removal, low-diversity filtering, and corpus
     # writing all happen inside this single streaming pass -- each document

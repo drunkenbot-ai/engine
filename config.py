@@ -50,6 +50,7 @@ class DatasetConfig:
             tokens regardless of this setting. 0 or a negative value disables the
             cap and trains on the entire corpus -- only safe if you have enough
             RAM to hold a frequency table for your full corpus size at once.
+        filter_low_diversity: Whether to detect and exclude synthetic repetitive documents.
     """
 
     input_dir: Path
@@ -84,6 +85,7 @@ class DatasetConfig:
     fast_scan_sample_bytes: int = 64 * 1024
     strict_duplicate_verification: bool = False
     tokenizer_training_max_gb: float = 2.0
+    filter_low_diversity: bool = True
 
 
 @dataclass

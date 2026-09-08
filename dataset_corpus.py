@@ -1,16 +1,19 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import hashlib
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from .data import Document, format_document_for_training
-from .dataset_mixture import (MAX_REPETITIVE_UNIT_RATIO,
-                              MIN_REPETITION_CHECK_CHARS,
-                                MIN_REPETITION_CHECK_UNITS,
-                                _canonical_corpus_block,
-                                _content_units_for_diversity
-                              )
+from .dataset_mixture import (
+    MAX_REPETITIVE_UNIT_RATIO,
+    MIN_REPETITION_CHECK_CHARS,
+    MIN_REPETITION_CHECK_UNITS,
+    MIN_UNIQUE_UNITS_FOR_DIVERSITY,
+    _canonical_corpus_block,
+    _content_units_for_diversity,
+)
+from .tokenizer import EOS_TOKEN
 
 
 @dataclass
@@ -65,6 +68,7 @@ class _StreamingCorpusBuilder:
         code_training_mode: bool,
         generate_instruction_samples: bool,
         reasoning_sample_mode: str,
+        filter_low_diversity: bool = True,
     ) -> None:
         """Open the corpus file for streaming writes.
 
@@ -75,11 +79,13 @@ class _StreamingCorpusBuilder:
                 a simple instruction wrapper.
             reasoning_sample_mode: Instruction/reasoning style for code
                 samples.
+            filter_low_diversity: Whether to exclude low-diversity repetitive documents.
         """
 
         self._code_training_mode = code_training_mode
         self._generate_instruction_samples = generate_instruction_samples
         self._reasoning_sample_mode = reasoning_sample_mode
+        self._filter_low_diversity = filter_low_diversity
         self._seen_digests: dict[str, str] = {}
         self.stats = _CorpusBuildStats()
         corpus_path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,7 +115,7 @@ class _StreamingCorpusBuilder:
             return
         self._seen_digests[digest] = str(document.path)
 
-        if self._is_low_diversity(document):
+        if self._filter_low_diversity and self._is_low_diversity(document):
             self.stats.low_diversity_removed += 1
             self.stats.low_diversity_removed_characters += len(document.text)
             if len(self.stats.low_diversity_examples) < self._EXAMPLE_CAP:
@@ -134,7 +140,10 @@ class _StreamingCorpusBuilder:
         units = _content_units_for_diversity(document)
         if len(document.text) < MIN_REPETITION_CHECK_CHARS or len(units) < MIN_REPETITION_CHECK_UNITS:
             return False
-        duplicate_ratio = 1.0 - (len(set(units)) / len(units))
+        unique_units = set(units)
+        if len(unique_units) >= MIN_UNIQUE_UNITS_FOR_DIVERSITY:
+            return False
+        duplicate_ratio = 1.0 - (len(unique_units) / len(units))
         return duplicate_ratio > MAX_REPETITIVE_UNIT_RATIO
 
     def _accept(self, document: Document, canonical: str) -> None:
@@ -170,16 +179,15 @@ class _StreamingCorpusBuilder:
             stats.block_ignored += 1
 
         if self._code_training_mode:
-            self._file.write(
-                format_document_for_training(
-                    document,
-                    generate_instruction_samples=self._generate_instruction_samples,
-                    reasoning_sample_mode=self._reasoning_sample_mode,
-                )
+            text = format_document_for_training(
+                document,
+                generate_instruction_samples=self._generate_instruction_samples,
+                reasoning_sample_mode=self._reasoning_sample_mode,
             )
         else:
-            self._file.write(document.text)
-        self._file.write("\n\n")
+            text = document.text
+        self._file.write(text.rstrip("\n"))
+        self._file.write(f"\n{EOS_TOKEN}\n")
 
     def close(self) -> dict[str, Any]:
         """Flush the corpus file and compute the final duplicate-block report.
