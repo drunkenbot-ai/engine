@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import shutil
 import subprocess
@@ -272,10 +272,11 @@ def export_llama_adapter_package(project_dir: Path, output_dir: Optional[Path] =
     llama_config = {
         "model_type": "llama", "architectures": ["LlamaForCausalLM"],
         "vocab_size": int(config["vocab_size"]), "hidden_size": hidden,
-        "intermediate_size": hidden * 4, "num_hidden_layers": int(config["layer_count"]),
+        "intermediate_size": int(config.get("intermediate_size", 0)) or (state["blocks.0.mlp.w1.weight"].shape[0] if "blocks.0.mlp.w1.weight" in state else hidden * 4),
+        "num_hidden_layers": int(config["layer_count"]),
         "num_attention_heads": heads, "num_key_value_heads": kv_heads,
         "max_position_embeddings": int(config["context_length"]),
-        "rope_theta": float(config.get("rope_theta", 10000.0)),
+        "rope_theta": float(config.get("rope_theta", 500000.0)),
         "rms_norm_eps": 1e-5, "hidden_act": "silu", "tie_word_embeddings": True,
         "bos_token_id": 2, "eos_token_id": 3, "pad_token_id": 0,
     }

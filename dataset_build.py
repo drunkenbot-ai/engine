@@ -437,6 +437,7 @@ def build_dataset(
         "train_tokens_path": "train_tokens.npy",
         "val_tokens_path": "val_tokens.npy",
         "prompt_loss_masking": bool(has_instruction_data),
+        "replay_buffer_ratio": float(config.replay_buffer_ratio),
         "token_storage_format": "npy",
         "train_window_count": train_window_count,
         "val_window_count": val_window_count,

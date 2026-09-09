@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from .config import ModelConfig, TrainingConfig
 
@@ -40,14 +40,15 @@ def estimate_parameter_breakdown(model_config: ModelConfig) -> dict[str, int]:
     attention = (emb * (emb + (2 * kv_emb))) + (emb * emb)
     if model_config.bias:
         attention += emb + (2 * kv_emb) + emb
+    inter = model_config.resolved_intermediate_size()
     if model_config.mlp_type == "swiglu":
-        mlp = emb * 4 * emb * 3
+        mlp = emb * inter * 3
         if model_config.bias:
-            mlp += 9 * emb
+            mlp += 3 * inter
     else:
-        mlp = (emb * 4 * emb) + (4 * emb * emb)
+        mlp = (emb * inter) + (inter * emb)
         if model_config.bias:
-            mlp += 5 * emb
+            mlp += inter + emb
     norms = 4 * emb
     return {
         "token_embedding": int(token_embedding),

@@ -262,6 +262,46 @@ def self_check_diversity(full_text: str) -> tuple[int, float, bool]:
     return len(units), duplicate_ratio, duplicate_ratio > MAX_REPETITIVE_UNIT_RATIO
 
 
+def generate_identity_corpus(
+    project_dir: Path,
+    output_path: Optional[Path] = None,
+    creator: str = "DrunkenBot",
+    maker: str = "Nilesh Jadhav",
+    role: str = "AI assistant",
+    sentence_count: int = 500,
+    seed: int = 1337,
+) -> Path:
+    """Generate the identity corpus file for a project.
+
+    Args:
+        project_dir: Project folder containing project.json.
+        output_path: Target path (defaults to project_dir / 'training_data' / 'identity' / 'identity_facts.txt').
+        creator: Creator organization name.
+        maker: Creator individual name.
+        role: Model persona role.
+        sentence_count: Number of distinct combinatorial sentences.
+        seed: Random seed.
+
+    Returns:
+        Path to the written file.
+    """
+    project_dir = Path(project_dir).resolve()
+    facts = load_project_facts(project_dir)
+    sentence_pool = build_sentence_pool(facts, creator, maker, role, sentence_count, seed)
+    paragraphs = group_into_paragraphs(sentence_pool, sentences_per_paragraph=(2, 4), seed=seed)
+    full_text = "\n\n".join(paragraphs) + "\n"
+
+    target = (
+        output_path
+        if output_path is not None
+        else project_dir / "training_data" / "identity" / "identity_facts.txt"
+    )
+    target = target if target.is_absolute() else project_dir / target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(full_text, encoding="utf-8")
+    return target
+
+
 def main() -> None:
     """Parse arguments, generate the identity corpus, and write it to disk."""
 

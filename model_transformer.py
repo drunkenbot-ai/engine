@@ -226,7 +226,7 @@ class MLP(nn.Module):
 
         super().__init__()
         self.mlp_type = config.mlp_type
-        hidden_size = 4 * config.embedding_size
+        hidden_size = config.resolved_intermediate_size()
         if self.mlp_type == "swiglu":
             self.w1 = nn.Linear(config.embedding_size, hidden_size, bias=config.bias)
             self.w2 = nn.Linear(hidden_size, config.embedding_size, bias=config.bias)

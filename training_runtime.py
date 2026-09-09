@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Optional, Union
+import warnings
 import numpy as np
 import numpy.lib.format as npy_format
 import torch
@@ -402,33 +403,99 @@ def split_tokens_to_files(
     return train_token_count, val_token_count
 def make_optimizer(model: MicroGPT, training_config: TrainingConfig) -> torch.optim.Optimizer:
     """Create the configured optimizer.
+
+    Separates 2D weight matrices (which receive weight decay) from 1D tensors
+    such as biases and normalization scales (which receive 0.0 weight decay)
+    to maintain numerical stability and avoid activation shrinkage in small models.
+    Supports standard AdamW (with fused=True on CUDA), 8-bit AdamW (bitsandbytes),
+    Adam, Lion, and Adafactor.
+
     Args:
         model: Model whose parameters will be optimized.
         training_config: Training configuration.
+
     Returns:
         Configured optimizer.
+
     Raises:
         ValueError: If the optimizer is unsupported by the installed PyTorch.
     """
     name = training_config.optimizer_name
-    common = {
-        "lr": training_config.learning_rate,
-        "weight_decay": training_config.weight_decay,
-    }
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if not parameters:
+
+    # Separate parameters into decayed (2D matrix weights) and non-decayed (biases, 1D norm scales)
+    decay_params: list[torch.nn.Parameter] = []
+    nodecay_params: list[torch.nn.Parameter] = []
+    seen_param_ids: set[int] = set()
+
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        param_id = id(param)
+        if param_id in seen_param_ids:
+            continue
+        seen_param_ids.add(param_id)
+
+        if param.dim() >= 2:
+            decay_params.append(param)
+        else:
+            nodecay_params.append(param)
+
+    optim_groups: list[dict[str, Any]] = []
+    if decay_params:
+        optim_groups.append({"params": decay_params, "weight_decay": training_config.weight_decay})
+    if nodecay_params:
+        optim_groups.append({"params": nodecay_params, "weight_decay": 0.0})
+
+    if not optim_groups:
         raise ValueError("No trainable parameters are available for optimization")
+
+    lr = training_config.learning_rate
+    device_is_cuda = (
+        isinstance(training_config.device, str)
+        and training_config.device.startswith("cuda")
+        and torch.cuda.is_available()
+    )
+
+    if name in {"adamw_8bit", "adamw8bit"}:
+        try:
+            import bitsandbytes as bnb
+            if device_is_cuda:
+                return bnb.optim.AdamW8bit(optim_groups, lr=lr, betas=(0.9, 0.95))
+            else:
+                warnings.warn(
+                    "8-bit AdamW requested on CPU; falling back to standard AdamW.",
+                    UserWarning,
+                )
+                return torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95))
+        except ImportError:
+            warnings.warn(
+                "bitsandbytes is not installed. Falling back to standard AdamW. "
+                "Install bitsandbytes ('pip install bitsandbytes') to enable 8-bit optimizer state compression.",
+                UserWarning,
+            )
+            try:
+                return torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), fused=device_is_cuda)
+            except Exception:
+                return torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95))
+
     if name == "adamw":
-        return torch.optim.AdamW(parameters, betas=(0.9, 0.95), **common)
+        try:
+            return torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), fused=device_is_cuda)
+        except Exception:
+            return torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95))
+
     if name == "adam":
-        return torch.optim.Adam(parameters, betas=(0.9, 0.95), **common)
+        return torch.optim.Adam(optim_groups, lr=lr, betas=(0.9, 0.95))
+
     if name == "lion":
-        return Lion(parameters, betas=(0.9, 0.99), **common)
+        return Lion(optim_groups, lr=lr, betas=(0.9, 0.99))
+
     if name == "adafactor":
         adafactor = getattr(torch.optim, "Adafactor", None)
         if adafactor is None:
             raise ValueError("Adafactor requires a newer PyTorch build that includes torch.optim.Adafactor")
-        return adafactor(parameters, **common)
+        return adafactor(optim_groups, lr=lr)
+
     raise ValueError(f"Unsupported optimizer: {name}")
 def make_scheduler(
     optimizer: torch.optim.Optimizer,

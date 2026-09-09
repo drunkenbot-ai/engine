@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import json
 import multiprocessing as mp
 import os
@@ -27,8 +27,8 @@ from .dataset_helpers import _emit, _cache_key, _local_structured_dataset_paths
 def _load_documents_with_cache(
         config: DatasetConfig,
         corpus_builder: "_StreamingCorpusBuilder",
-        progress: Optional[Callable[[Any], None]],
-        should_stop: Optional[Callable[[], bool]],
+        progress: Optional[Callable[[Any], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
 ) -> tuple[Any, int, int, int, int, int, int]:
     """Load documents using an extraction cache and stream them into the corpus.
 
@@ -121,6 +121,36 @@ def _load_documents_with_cache(
         for path in source_paths
         if path.resolve() not in configured_structured_files
     ]
+
+    is_fine_tune_stage = config.dataset_stage in {"instruction", "conversation", "tool_call"}
+    has_structured_data = bool(local_structured_paths or config.conversation_datasets)
+    if is_fine_tune_stage and has_structured_data:
+        if config.replay_buffer_ratio > 0.0:
+            candidate_base_paths = list(source_paths)
+            if not candidate_base_paths and config.input_dir.exists():
+                candidate_base_paths = [
+                    path for path in supported_source_paths(
+                        config.input_dir,
+                        code_training_mode=config.code_training_mode,
+                        include_source_code=config.include_source_code,
+                    )
+                    if path.resolve() not in configured_structured_files
+                ]
+            if candidate_base_paths:
+                sample_count = max(1, int(round(len(candidate_base_paths) * config.replay_buffer_ratio)))
+                sorted_candidates = sorted(candidate_base_paths, key=lambda p: abs(hash(p.name)))
+                source_paths = sorted_candidates[:sample_count]
+                _emit(
+                    progress,
+                    f"Knowledge Replay Buffer: blended {len(source_paths)} pre-training document(s) "
+                    f"({config.replay_buffer_ratio:.0%}) to preserve base language representations.",
+                    9,
+                )
+            else:
+                source_paths = []
+        else:
+            source_paths = []
+
     _emit(progress,
           f"Found {len(source_paths)} supported files in {config.input_dir}.",
           8)

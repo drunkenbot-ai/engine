@@ -311,24 +311,54 @@ def train_model(
         and train_targets is not None
     )
     if is_instruction_tuning:
-        from .target_masking import InstructionDataset, collate_instruction_batch
-        train_ds = InstructionDataset(
-            train_tokens,
-            targets=train_targets,
-            context_length=model_config.context_length,
-            eos_token_id=eos_token_id,
-        )
-        if len(train_ds) > 0:
-            emit_progress(progress, f'Discrete sample dataset active: {len(train_ds):,} instruction sample(s).', 4)
-            train_loader = DataLoader(
-                train_ds,
-                batch_size=training_config.batch_size,
-                shuffle=True,
-                drop_last=len(train_ds) > training_config.batch_size,
-                collate_fn=lambda b: collate_instruction_batch(b, pad_token_id),
-                **loader_kwargs,
+        use_packing = bool(getattr(training_config, "sequence_packing", False))
+        if use_packing:
+            from .target_masking import PackedInstructionDataset
+            train_ds = PackedInstructionDataset(
+                train_tokens,
+                targets=train_targets,
+                context_length=model_config.context_length,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
             )
+            if len(train_ds) > 0:
+                emit_progress(
+                    progress,
+                    f'Sequence-packed dataset active: {len(train_ds):,} packed bins '
+                    f'from {train_ds.total_unpacked_samples:,} discrete sample(s).',
+                    4,
+                )
+                train_loader = DataLoader(
+                    train_ds,
+                    batch_size=training_config.batch_size,
+                    shuffle=True,
+                    drop_last=len(train_ds) > training_config.batch_size,
+                    **loader_kwargs,
+                )
+            else:
+                train_loader = None
         else:
+            from .target_masking import InstructionDataset, collate_instruction_batch
+            train_ds = InstructionDataset(
+                train_tokens,
+                targets=train_targets,
+                context_length=model_config.context_length,
+                eos_token_id=eos_token_id,
+            )
+            if len(train_ds) > 0:
+                emit_progress(progress, f'Discrete sample dataset active: {len(train_ds):,} instruction sample(s).', 4)
+                train_loader = DataLoader(
+                    train_ds,
+                    batch_size=training_config.batch_size,
+                    shuffle=True,
+                    drop_last=len(train_ds) > training_config.batch_size,
+                    collate_fn=lambda b: collate_instruction_batch(b, pad_token_id),
+                    **loader_kwargs,
+                )
+            else:
+                train_loader = None
+
+        if train_loader is None:
             train_loader = DataLoader(
                 TokenDataset(
                     train_tokens,
@@ -357,22 +387,41 @@ def train_model(
 
     val_loader = None
     if is_instruction_tuning and val_tokens is not None and len(val_tokens) >= 2:
-        from .target_masking import InstructionDataset, collate_instruction_batch
-        val_ds = InstructionDataset(
-            val_tokens,
-            targets=val_targets,
-            context_length=model_config.context_length,
-            eos_token_id=eos_token_id,
-        )
-        if len(val_ds) > 0:
-            val_loader = DataLoader(
-                val_ds,
-                batch_size=training_config.batch_size,
-                shuffle=False,
-                drop_last=False,
-                collate_fn=lambda b: collate_instruction_batch(b, pad_token_id),
-                **loader_kwargs,
+        use_packing = bool(getattr(training_config, "sequence_packing", False))
+        if use_packing:
+            from .target_masking import PackedInstructionDataset
+            val_ds = PackedInstructionDataset(
+                val_tokens,
+                targets=val_targets,
+                context_length=model_config.context_length,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
             )
+            if len(val_ds) > 0:
+                val_loader = DataLoader(
+                    val_ds,
+                    batch_size=training_config.batch_size,
+                    shuffle=False,
+                    drop_last=False,
+                    **loader_kwargs,
+                )
+        else:
+            from .target_masking import InstructionDataset, collate_instruction_batch
+            val_ds = InstructionDataset(
+                val_tokens,
+                targets=val_targets,
+                context_length=model_config.context_length,
+                eos_token_id=eos_token_id,
+            )
+            if len(val_ds) > 0:
+                val_loader = DataLoader(
+                    val_ds,
+                    batch_size=training_config.batch_size,
+                    shuffle=False,
+                    drop_last=False,
+                    collate_fn=lambda b: collate_instruction_batch(b, pad_token_id),
+                    **loader_kwargs,
+                )
     elif len(val_tokens) > model_config.context_length:
         val_stride = max(1, model_config.context_length)
         val_loader = DataLoader(

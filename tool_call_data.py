@@ -41,6 +41,10 @@ def format_tool_call_record(record: Any) -> str:
 def _format_prompt_completion_call(record: dict[str, Any]) -> str:
     """Render a compact prompt/function-call record when messages are absent.
 
+    Supports both tool-call invocations and contrastive negative samples where
+    tools are declared but the assistant provides a direct answer without calling
+    a tool (teaching the model tool restraint awareness).
+
     Args:
         record: Decoded JSON training example.
 
@@ -50,15 +54,25 @@ def _format_prompt_completion_call(record: dict[str, Any]) -> str:
 
     prompt = _text(record.get("prompt", record.get("input", record.get("instruction", ""))))
     call = record.get("tool_call", record.get("function_call"))
-    if not prompt or not isinstance(call, dict):
+    if not prompt:
         return ""
-    lines = _format_tools(record.get("tools", record.get("functions", [])))
-    lines.append(f"User: {prompt}")
-    lines.append(_tool_calls_block([call]))
-    result = record.get("tool_result", record.get("function_result"))
-    if result is not None:
-        lines.append(_tool_result_block(result, record.get("tool_call_id", "")))
-    return "\n".join(lines)
+    if isinstance(call, dict):
+        lines = _format_tools(record.get("tools", record.get("functions", [])))
+        lines.append(f"User: {prompt}")
+        lines.append(_tool_calls_block([call]))
+        result = record.get("tool_result", record.get("function_result"))
+        if result is not None:
+            lines.append(_tool_result_block(result, record.get("tool_call_id", "")))
+        return "\n".join(lines)
+
+    # Contrastive negative sample: tools declared, but direct response is provided without tool call
+    response = _text(record.get("response", record.get("completion", record.get("output", ""))))
+    if response and bool(record.get("tools") or record.get("functions")):
+        lines = _format_tools(record.get("tools", record.get("functions", [])))
+        lines.append(f"User: {prompt}")
+        lines.append(f"Assistant: {response}")
+        return "\n".join(lines)
+    return ""
 
 
 def _format_tools(tools: Any) -> list[str]:
@@ -91,7 +105,11 @@ def _format_message(message: Any) -> str:
     role = str(message.get("role", message.get("from", "message"))).lower()
     if role in {"tool", "function"}:
         return _tool_result_block(message.get("content", message.get("result", "")), message.get("tool_call_id", message.get("name", "")))
+    thought = _text(message.get("thought", message.get("reasoning", message.get("reasoning_content", ""))))
     content = _text(message.get("content", message.get("value", message.get("text", ""))))
+    if thought:
+        thought_tag = f"<thought>{thought}</thought>"
+        content = f"{thought_tag}\n{content}".strip() if content else thought_tag
     label = {"user": "User", "assistant": "Assistant", "system": "System", "developer": "Developer"}.get(role, role.title())
     lines = [f"{label}: {content}".rstrip()] if content else []
     calls = message.get("tool_calls")
@@ -212,3 +230,88 @@ def _text(value: Any) -> str:
     """
 
     return str(value or "").strip()
+
+
+STANDARD_AGENT_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for live information, current events, documentation, or facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query to execute"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "python_interpreter",
+            "description": "Execute Python code or mathematical calculations and return stdout or result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Valid Python code to execute"},
+                },
+                "required": ["code"],
+            },
+        },
+    },
+]
+
+
+def create_contrastive_negative_sample(
+    prompt: str,
+    direct_answer: str,
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Create a contrastive negative sample where tools are declared but direct answer is given.
+
+    Teaching the model tool restraint (awareness of when NOT to call tools) is essential
+    to prevent runaway hallucinations on basic conversational queries.
+
+    Args:
+        prompt: User input question.
+        direct_answer: Direct assistant response.
+        tools: Tool definitions declared in context (defaults to STANDARD_AGENT_TOOLS).
+
+    Returns:
+        Structured dictionary matching OpenAI Chat Completions dataset format.
+    """
+
+    return {
+        "tools": tools or STANDARD_AGENT_TOOLS,
+        "messages": [
+            {"role": "user", "content": prompt.strip()},
+            {"role": "assistant", "content": direct_answer.strip()},
+        ],
+    }
+
+
+def create_multihop_agent_trajectory(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Create a structured multi-hop agent trajectory record.
+
+    Supports recursive ReAct problem-solving sequences:
+    User -> Thought 1 + Tool Call 1 -> Tool Result 1 -> Thought 2 + Tool Call 2 -> Tool Result 2 -> Final Answer.
+
+    Args:
+        messages: Sequence of dialogue, tool invocation, and execution result turns.
+        tools: Tool definitions available to the agent (defaults to STANDARD_AGENT_TOOLS).
+
+    Returns:
+        Deterministic OpenAI-format multi-turn record.
+    """
+
+    return {
+        "tools": tools or STANDARD_AGENT_TOOLS,
+        "messages": messages,
+    }
+
+

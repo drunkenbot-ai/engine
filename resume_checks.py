@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional
@@ -121,10 +121,12 @@ def _validate_resume_compatibility(
         "norm_type": "layernorm",
         "position_encoding": "learned",
         "mlp_type": "gelu",
-        "rope_theta": 10000.0,
+        "rope_theta": 500000.0,
         "attention_type": "mha",
     }
     previous = {key: checkpoint_config.get(key, legacy_defaults.get(key)) for key in current}
+    if current.get("position_encoding") != "rope" and previous.get("position_encoding") != "rope":
+        previous["rope_theta"] = current.get("rope_theta")
     mismatches = {
         key: {"checkpoint": previous.get(key), "current": current.get(key)}
         for key in current

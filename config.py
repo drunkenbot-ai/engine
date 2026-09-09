@@ -88,6 +88,14 @@ class DatasetConfig:
     strict_duplicate_verification: bool = False
     tokenizer_training_max_gb: float = 2.0
     filter_low_diversity: bool = True
+    replay_buffer_ratio: float = 0.05
+
+    def validate(self) -> None:
+        """Validate dataset configuration constraints."""
+        if self.replay_buffer_ratio < 0.0 or self.replay_buffer_ratio > 1.0:
+            raise ValueError("replay_buffer_ratio must be between 0.0 and 1.0")
+        if self.validation_split < 0.0 or self.validation_split >= 1.0:
+            raise ValueError("validation_split must be in [0.0, 1.0)")
 
 
 @dataclass
@@ -122,7 +130,8 @@ class ModelConfig:
     norm_type: str = "layernorm"
     position_encoding: str = "learned"
     mlp_type: str = "gelu"
-    rope_theta: float = 10000.0
+    intermediate_size: int = 0
+    rope_theta: float = 500000.0
     attention_type: str = "mha"
     kv_head_count: int = 0
     attention_backend: str = "sdpa"
@@ -176,6 +185,26 @@ class ModelConfig:
             return self.kv_head_count if self.kv_head_count > 0 else max(1, self.head_count // 2)
         return self.head_count
 
+    def resolved_intermediate_size(self) -> int:
+        """Return the effective intermediate feed-forward dimension.
+
+        If intermediate_size is explicitly configured (> 0), returns that value.
+        Otherwise, for SwiGLU, applies the canonical LLaMA/Mistral dimension:
+        floor(2/3 * 4 * embedding_size) = 8/3 * embedding_size, rounded up
+        to a multiple of 64 for optimal tensor core alignment and ~33% VRAM savings.
+        For GELU, defaults to 4 * embedding_size.
+
+        Returns:
+            Intermediate hidden dimension.
+        """
+
+        if self.intermediate_size > 0:
+            return self.intermediate_size
+        if self.mlp_type == "swiglu":
+            base = int(8 * self.embedding_size / 3)
+            return ((base + 63) // 64) * 64
+        return 4 * self.embedding_size
+
 
 @dataclass
 class TrainingConfig:
@@ -187,7 +216,7 @@ class TrainingConfig:
         batch_size: Number of token windows per training batch.
         learning_rate: Base optimizer learning rate.
         weight_decay: Optimizer weight decay regularization.
-        optimizer_name: Optimizer family: adamw, adam, lion, or adafactor.
+        optimizer_name: Optimizer family: adamw, adamw_8bit, adam, lion, or adafactor.
         scheduler_name: Learning-rate schedule: warmup_linear, cosine, polynomial, one_cycle, or constant.
         scheduler_min_lr_ratio: Minimum learning-rate multiplier after decay.
         polynomial_power: Power used by polynomial decay.
@@ -239,6 +268,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     activation_checkpointing: bool = False
     compile_model: bool = False
+    sequence_packing: bool = True
     use_amp: bool = True
     precision: str = "fp16"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -266,8 +296,8 @@ class TrainingConfig:
             ValueError: If any optimization setting is unsupported.
         """
 
-        if self.optimizer_name not in {"adamw", "adam", "lion", "adafactor"}:
-            raise ValueError("optimizer_name must be adamw, adam, lion, or adafactor")
+        if self.optimizer_name not in {"adamw", "adamw_8bit", "adam", "lion", "adafactor"}:
+            raise ValueError("optimizer_name must be adamw, adamw_8bit, adam, lion, or adafactor")
         if self.scheduler_name not in {"warmup_linear", "cosine", "polynomial", "one_cycle", "constant"}:
             raise ValueError("scheduler_name must be warmup_linear, cosine, polynomial, one_cycle, or constant")
         if self.precision not in {"fp32", "fp16", "bf16"}:
