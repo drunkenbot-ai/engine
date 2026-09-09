@@ -19,7 +19,17 @@ PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
 BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
-SPECIAL_TOKENS = [PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN]
+TOOL_TOKENS = [
+    "<tools>",
+    "</tools>",
+    "<tool_calls>",
+    "</tool_calls>",
+    "<tool_result>",
+    "</tool_result>",
+    "<CALL>",
+    "</CALL>",
+]
+SPECIAL_TOKENS = [PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN, *TOOL_TOKENS]
 DEFAULT_CHAT_TEMPLATE = """{% for message in messages %}{{ '<bos>' if loop.first else '' }}{{ message['role'] | capitalize }}: {{ message['content'] }}{{ '<eos>' if loop.last else '\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '\\nAssistant:' }}{% endif %}"""
 MAX_TOKENIZER_LINE_CHARS = 8_192
 # The Rust BPE trainer builds an in-memory pretoken frequency table sized to

@@ -79,6 +79,8 @@ class DatasetConfig:
     conversation_dataset_paths: list[Path] = field(default_factory=list)
     instruction_dataset_paths: list[Path] = field(default_factory=list)
     tool_call_dataset_paths: list[Path] = field(default_factory=list)
+    code_dataset_path: Optional[Path] = None
+    code_dataset_paths: list[Path] = field(default_factory=list)
     default_data_paths: list[Path] = field(default_factory=list)
     mixture_weights: dict[str, float] = field(default_factory=dict)
     fast_scan_mode: bool = False

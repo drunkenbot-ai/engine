@@ -78,7 +78,7 @@ def train_from_dataset(
     # If targets are not precomputed but dataset is instruction/conversation tuning,
     # generate target masks dynamically from corpus.txt if available.
     if train_targets is None and (
-        dataset_summary.get("dataset_stage") in {"instruction", "conversation", "tool_call"}
+        dataset_summary.get("dataset_stage") in {"instruction", "conversation", "tool_call", "code"}
         or training_config.training_mode == "fine_tune"
     ):
         corpus_path = data_dir / "corpus.txt"

@@ -200,7 +200,7 @@ class LlamaChatSession:
                 top_p=top_p,
                 repeat_penalty=repeat_penalty,
                 stream=True,
-                stop=["\nUser:", "\nSystem:", "\nHuman:", "<|endoftext|>", "<eos>"],
+                stop=["\nUser:", "\nSystem:", "\nHuman:", "</tool_calls>", "</CALL>", "<|endoftext|>", "<eos>"],
             )
             for chunk in stream:
                 if should_stop and should_stop():

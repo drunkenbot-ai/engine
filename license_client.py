@@ -1,4 +1,4 @@
-﻿"""IDE license validation: online-first, with a signed offline grace cache.
+"""IDE license validation: online-first, with a signed offline grace cache.
 
 Calls the DrunkenBot cloud service's ``POST /license/validate`` at launch.
 On success, caches a short-lived signed "grace receipt" locally so the app
@@ -31,9 +31,14 @@ from typing import Optional
 import traceback
 import ssl
 import certifi
+import sys
+import base64
 
 from cryptography.exceptions import InvalidSignature
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
 # --- REPLACE BEFORE SHIPPING: see module docstring. ---
@@ -44,11 +49,12 @@ MCowBQYDK2VwAyEAledx+Yhz/kvDTBFfBscicAMUIcwwG2jI2/zrwK6VFwI=
 
 LICENSE_DIR = Path.home() / ".drunkenbot_ide" / "license"
 LICENSE_KEY_FILE = LICENSE_DIR / "license_key.txt"
+LICENSE_VAULT_FILE = LICENSE_DIR / "license_vault.enc"
 GRACE_CACHE_FILE = LICENSE_DIR / "grace_receipt.json"
 MACHINE_ID_FILE = LICENSE_DIR / "machine_id.txt"
 
-_REQUEST_TIMEOUT_SECONDS = 15.0
-_ONLINE_VALIDATION_ATTEMPTS = 5
+_REQUEST_TIMEOUT_SECONDS = 10.0
+_ONLINE_VALIDATION_ATTEMPTS = 2
 
 
 @dataclass
@@ -184,13 +190,199 @@ def _verify_receipt(receipt: str, signature_b64: str) -> dict:
     return json.loads(receipt)
 
 
+def _derive_machine_key(machine_id: str) -> bytes:
+    """Derive an authenticated encryption key bound to this machine.
+
+    Combines the persistent machine_id with the local hardware node
+    (MAC/hardware address) and a dedicated salt via PBKDF2-HMAC-SHA256.
+    """
+    salt = b"drunkenbot_ide_vault_v1"
+    seed = f"{machine_id}:{uuid.getnode()}".encode("utf-8")
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=50_000,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(seed))
+
+
+def _dpapi_protect(data: bytes) -> bytes:
+    """Encrypt data bound to the current Windows user and machine credentials."""
+    if sys.platform != "win32":
+        return data
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    blob_in = DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)))
+    blob_out = DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(blob_in), "license_vault", None, None, None, 0, ctypes.byref(blob_out)
+    ):
+        raise RuntimeError("Windows DPAPI CryptProtectData failed.")
+    result = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    return result
+
+
+def _dpapi_unprotect(data: bytes) -> bytes:
+    """Decrypt data bound to the current Windows user and machine credentials."""
+    if sys.platform != "win32":
+        return data
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    blob_in = DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)))
+    blob_out = DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    ):
+        raise RuntimeError("Windows DPAPI CryptUnprotectData failed.")
+    result = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    return result
+
+
+def encrypt_license_metadata(metadata: dict, machine_id: Optional[str] = None) -> bytes:
+    """Encrypt license metadata dictionary using machine-bound two-layer encryption."""
+    if machine_id is None:
+        machine_id = _get_or_create_machine_id()
+    raw_bytes = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+    fernet_key = _derive_machine_key(machine_id)
+    f = Fernet(fernet_key)
+    fernet_token = f.encrypt(raw_bytes)
+    if sys.platform == "win32":
+        try:
+            dpapi_token = _dpapi_protect(fernet_token)
+            return b"DBDPAPI:" + dpapi_token
+        except Exception:
+            pass
+    return b"DBFERNET:" + fernet_token
+
+
+def decrypt_license_metadata(blob: bytes, machine_id: Optional[str] = None) -> dict:
+    """Decrypt machine-bound encrypted license blob and return dictionary.
+
+    Raises:
+        InvalidToken, RuntimeError, or ValueError if decryption fails.
+    """
+    if machine_id is None:
+        machine_id = _get_or_create_machine_id()
+
+    if blob.startswith(b"DBDPAPI:"):
+        raw_cipher = blob[len(b"DBDPAPI:"):]
+        fernet_token = _dpapi_unprotect(raw_cipher)
+    elif blob.startswith(b"DBFERNET:"):
+        fernet_token = blob[len(b"DBFERNET:"):]
+    else:
+        fernet_token = blob
+
+    fernet_key = _derive_machine_key(machine_id)
+    f = Fernet(fernet_key)
+    raw_bytes = f.decrypt(fernet_token)
+    return json.loads(raw_bytes.decode("utf-8"))
+
+
+def save_encrypted_license(metadata: dict) -> None:
+    """Persist license metadata encrypted on the user's machine."""
+    LICENSE_DIR.mkdir(parents=True, exist_ok=True)
+    blob = encrypt_license_metadata(metadata)
+    LICENSE_VAULT_FILE.write_bytes(blob)
+    if "license_key" in metadata and metadata["license_key"]:
+        try:
+            LICENSE_KEY_FILE.write_text(str(metadata["license_key"]).strip(), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def load_encrypted_license() -> Optional[dict]:
+    """Load and decrypt the local license vault, or None if unreadable or missing."""
+    if not LICENSE_VAULT_FILE.exists():
+        return None
+    try:
+        blob = LICENSE_VAULT_FILE.read_bytes()
+        return decrypt_license_metadata(blob)
+    except Exception:
+        return None
+
+
+def clear_encrypted_license() -> None:
+    """Delete the encrypted license vault."""
+    LICENSE_VAULT_FILE.unlink(missing_ok=True)
+
+
+def check_local_license(app_version: str) -> LicenseCheckResult:
+    """Check if a valid, unexpired, machine-matched license is stored locally.
+
+    Returns:
+        LicenseCheckResult indicating if local encrypted license is valid.
+    """
+    metadata = load_encrypted_license()
+    if not metadata:
+        return LicenseCheckResult(
+            valid=False,
+            reason="No valid local encrypted license found on this machine.",
+        )
+
+    current_machine_id = _get_or_create_machine_id()
+    vault_machine_id = metadata.get("machine_id")
+    if vault_machine_id and vault_machine_id != current_machine_id:
+        return LicenseCheckResult(
+            valid=False,
+            reason="Local license is bound to a different machine.",
+        )
+
+    if not metadata.get("valid", False):
+        return LicenseCheckResult(
+            valid=False,
+            reason=metadata.get("reason", "Local license is marked invalid."),
+        )
+
+    version_ceiling = metadata.get("version_ceiling")
+    if version_ceiling and not _is_version_within_ceiling(app_version, version_ceiling):
+        return LicenseCheckResult(
+            valid=False,
+            reason=f"This license covers up to version {version_ceiling}.",
+            version_ceiling=version_ceiling,
+        )
+
+    grace_period_until = metadata.get("grace_period_until")
+    if grace_period_until:
+        try:
+            valid_until = datetime.fromisoformat(grace_period_until)
+            if datetime.now(timezone.utc) > valid_until:
+                return LicenseCheckResult(
+                    valid=False,
+                    reason="The local license validity period has expired.",
+                    grace_period_until=grace_period_until,
+                )
+        except Exception:
+            pass
+
+    return LicenseCheckResult(
+        valid=True,
+        reason="Validated from local encrypted license.",
+        used_offline_grace=False,
+        version_ceiling=version_ceiling,
+        grace_period_until=grace_period_until,
+    )
+
+
 def load_stored_license_key() -> Optional[str]:
     """Return the previously activated license key, if any.
 
     Returns:
         Stored license key, or ``None`` if never activated.
     """
-
+    metadata = load_encrypted_license()
+    if metadata and metadata.get("license_key"):
+        return str(metadata["license_key"]).strip()
     if not LICENSE_KEY_FILE.exists():
         return None
     key = LICENSE_KEY_FILE.read_text(encoding="utf-8").strip()
@@ -238,15 +430,10 @@ def _store_cached_receipt(receipt: str, signature: str) -> None:
 
 
 def _clear_cached_receipt() -> None:
-    """Delete any cached grace receipt.
-
-    Called whenever the server gives an explicit, live rejection (revoked,
-    version no longer covered, etc.) so that result cannot be bypassed on a
-    later launch by simply blocking network access and falling back to a
-    stale cached grace receipt that predates the rejection.
-    """
+    """Delete any cached grace receipt and encrypted vault."""
 
     GRACE_CACHE_FILE.unlink(missing_ok=True)
+    clear_encrypted_license()
 
 
 def _validate_online(license_key: str, app_version: str, server_url: str) -> Optional[dict]:
@@ -306,17 +493,17 @@ def _validate_online(license_key: str, app_version: str, server_url: str) -> Opt
 
 
 def check_license_at_launch(app_version: str, server_url: str) -> LicenseCheckResult:
-    """Validate the license at app startup: online-first, offline-graceful.
+    """Validate the license at app startup: local-first, online fallback.
 
     Order of operations:
-      1. No stored license key at all -> not licensed, ask the user to
-         activate.
-      2. Server reachable -> its answer is authoritative. A live "invalid"
-         response also clears any cached grace receipt (see
-         :func:`_clear_cached_receipt`), so a revoked license cannot be
-         revived later just by cutting network access.
+      1. First check if locally user has a valid encrypted license.
+         If valid, consider it valid immediately without remote network calls
+         or activation dialogs.
+      2. If local check fails (no file, expired, corrupted, or machine mismatch),
+         fall back to online validation if a stored license key exists.
       3. Server unreachable -> fall back to a cached grace receipt, if one
          exists, is correctly signed, and has not expired.
+      4. If all fail -> not licensed, return invalid result to prompt for activation.
 
     Args:
         app_version: Version of the running app (compared against the
@@ -327,6 +514,11 @@ def check_license_at_launch(app_version: str, server_url: str) -> LicenseCheckRe
         License check result.
     """
 
+    # 1. Local-first check
+    local_result = check_local_license(app_version)
+    if local_result.valid:
+        return local_result
+
     license_key = load_stored_license_key()
     if not license_key:
         return LicenseCheckResult(valid=False, reason="No license activated on this machine.")
@@ -336,13 +528,31 @@ def check_license_at_launch(app_version: str, server_url: str) -> LicenseCheckRe
         if response.get("valid"):
             receipt = response.get("receipt")
             signature = response.get("signature")
+            version_ceiling = response.get("version_ceiling") or "999.0.0"
+            grace_period_until = response.get("grace_period_until")
+
+            vault_metadata = {
+                "license_key": license_key,
+                "machine_id": _get_or_create_machine_id(),
+                "hardware_node": str(uuid.getnode()),
+                "activated_at": datetime.now(timezone.utc).isoformat(),
+                "last_verified_at": datetime.now(timezone.utc).isoformat(),
+                "valid": True,
+                "version_ceiling": version_ceiling,
+                "grace_period_until": grace_period_until,
+                "receipt": receipt,
+                "signature": signature,
+                "app_version": app_version,
+            }
+            save_encrypted_license(vault_metadata)
+
             if receipt and signature:
                 _store_cached_receipt(receipt, signature)
             return LicenseCheckResult(
                 valid=True,
                 reason="Validated online.",
-                version_ceiling=response.get("version_ceiling"),
-                grace_period_until=response.get("grace_period_until"),
+                version_ceiling=version_ceiling,
+                grace_period_until=grace_period_until,
             )
         # Authoritative, live rejection -- do not let a stale cache override this.
         _clear_cached_receipt()
@@ -358,7 +568,7 @@ def check_license_at_launch(app_version: str, server_url: str) -> LicenseCheckRe
     if cached is None:
         return LicenseCheckResult(
             valid=False,
-            reason="Could not reach the license server and no cached grace period is available. "
+            reason="Could not reach the license server and no valid local license is available. "
             "Please connect to the internet once to validate your license.",
         )
     receipt_json, signature = cached
@@ -389,4 +599,71 @@ def check_license_at_launch(app_version: str, server_url: str) -> LicenseCheckRe
         used_offline_grace=True,
         version_ceiling=payload["version_ceiling"],
     )
+
+
+def activate_license(license_key: str, app_version: str, server_url: str) -> LicenseCheckResult:
+    """Validate a license key with the server and persist encrypted metadata locally.
+
+    Args:
+        license_key: License key to activate.
+        app_version: Current application version.
+        server_url: Base URL of the DrunkenBot cloud service.
+
+    Returns:
+        LicenseCheckResult indicating activation outcome.
+    """
+    clean_key = license_key.strip()
+    if not clean_key:
+        return LicenseCheckResult(valid=False, reason="Please enter a license key.")
+
+    response = _validate_online(clean_key, app_version, server_url)
+    if response is not None:
+        if response.get("valid"):
+            version_ceiling = response.get("version_ceiling") or "999.0.0"
+            grace_period_until = response.get("grace_period_until")
+            receipt = response.get("receipt")
+            signature = response.get("signature")
+
+            metadata = {
+                "license_key": clean_key,
+                "machine_id": _get_or_create_machine_id(),
+                "hardware_node": str(uuid.getnode()),
+                "activated_at": datetime.now(timezone.utc).isoformat(),
+                "last_verified_at": datetime.now(timezone.utc).isoformat(),
+                "valid": True,
+                "version_ceiling": version_ceiling,
+                "grace_period_until": grace_period_until,
+                "receipt": receipt,
+                "signature": signature,
+                "app_version": app_version,
+            }
+            save_encrypted_license(metadata)
+            store_license_key(clean_key)
+            if receipt and signature:
+                _store_cached_receipt(receipt, signature)
+
+            return LicenseCheckResult(
+                valid=True,
+                reason="License activated successfully.",
+                version_ceiling=version_ceiling,
+                grace_period_until=grace_period_until,
+            )
+
+        # Explicit rejection from server
+        clear_encrypted_license()
+        _clear_cached_receipt()
+        return LicenseCheckResult(
+            valid=False,
+            reason=response.get("reason", "License key is invalid or not found."),
+            version_ceiling=response.get("version_ceiling"),
+            grace_period_until=response.get("grace_period_until"),
+        )
+
+    # Server unreachable during activation
+    return LicenseCheckResult(
+        valid=False,
+        reason="Could not reach the license server to activate. "
+        "Please check your internet connection and try again.",
+    )
+
 

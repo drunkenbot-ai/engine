@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import logging
 import json
 from pathlib import Path
@@ -44,6 +44,13 @@ def _local_structured_dataset_paths(config: DatasetConfig) -> list[
         if key not in seen:
             seen.add(key)
             items.append((Path(path), "tool_call", "local tool-call"))
+    for path in [config.code_dataset_path, *config.code_dataset_paths]:
+        if path is None or not str(path).strip():
+            continue
+        key = ("code", str(Path(path)))
+        if key not in seen:
+            seen.add(key)
+            items.append((Path(path), "code", "local code"))
     return items
 def _emit(
     progress: Optional[Callable[[Any], None]],

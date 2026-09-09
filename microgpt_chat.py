@@ -12,7 +12,16 @@ from .config import ModelConfig
 from .model import MicroGPT
 from .tokenizer import EOS_TOKEN, load_tokenizer, token_id
 
-STOP_SEQUENCES = ("\nUser:", "\nSystem:", "\nHuman:", "\nAssistant:", "<|endoftext|>", "<eos>")
+STOP_SEQUENCES = (
+    "\nUser:",
+    "\nSystem:",
+    "\nHuman:",
+    "\nAssistant:",
+    "</tool_calls>",
+    "</CALL>",
+    "<|endoftext|>",
+    "<eos>",
+)
 
 
 class MicroGPTChatSession:
@@ -187,7 +196,11 @@ class MicroGPTChatSession:
             reply = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip() if generated_ids else ""
             for s in STOP_SEQUENCES:
                 if s in reply:
-                    reply = reply.split(s)[0].strip()
+                    if s in ("</tool_calls>", "</CALL>"):
+                        idx = reply.find(s)
+                        reply = reply[: idx + len(s)].strip()
+                    else:
+                        reply = reply.split(s)[0].strip()
             reply = reply.rstrip("\ufffd").strip()
             if reply:
                 self._messages.append({"role": "user", "content": prompt})

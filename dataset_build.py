@@ -324,7 +324,7 @@ def build_dataset(
     token_dtype = token_dtype_for_vocab(tokenizer.get_vocab_size())
     all_tokens_path = config.output_dir / "all_tokens.npy"
     all_targets_path = config.output_dir / "all_targets.npy"
-    has_instruction_data = config.dataset_stage in {"instruction", "conversation", "tool_call"} or stats.conversation_sample_count > 0
+    has_instruction_data = config.dataset_stage in {"instruction", "conversation", "tool_call", "code"} or stats.conversation_sample_count > 0 or (config.dataset_stage == "code" and stats.code_sample_count > 0)
     if has_instruction_data:
         token_count = encode_file_with_targets(
             tokenizer, corpus_path, all_tokens_path, all_targets_path, token_dtype,
@@ -457,6 +457,8 @@ def build_dataset(
                                       config.instruction_dataset_paths],
         "tool_call_dataset_paths": [str(path) for path in
                                     config.tool_call_dataset_paths],
+        "code_dataset_path": str(config.code_dataset_path or ""),
+        "code_dataset_paths": [str(path) for path in config.code_dataset_paths],
         "default_data_paths": [str(path) for path in
                                config.default_data_paths],
         "mixture_weights": config.mixture_weights,

@@ -21,9 +21,11 @@ from .tokenizer import Tokenizer, convert_bin_to_npy
 IGNORE_INDEX: int = -100
 
 # Matches assistant response text following an Assistant: or Response: or Completion: header
-# until the next role turn (User:, System:, Instruction:) or the document end / <|endoftext|> / <eos>.
+# (or direct <tool_calls> / <CALL> tags) until the next role turn (User:, System:, Instruction:, Assistant:),
+# external tool result (<tool_result>, <RESULT>), or document end (<|endoftext|>, <eos>, $).
 _COMPLETION_PATTERN = re.compile(
-    r"(?:(?:^|\n)(?:Assistant|Response|Completion):\s*)(.*?)(?=(?:\n(?:User|System|Instruction|Input|Prompt):|<\|endoftext\|>|<eos>|$))",
+    r"(?:(?:^|\n)(?:Assistant|Response|Completion):\s*|(?:^|\n)(?=<tool_calls>|<CALL>))(.*?)"
+    r"(?=(?:\n(?:User|System|Instruction|Input|Prompt|Assistant):|\n<(?:tool_result|RESULT)|<\|endoftext\|>|<eos>|$))",
     re.DOTALL,
 )
 

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -496,7 +496,7 @@ def load_jsonl_documents_with_diagnostics(
         if validation_error:
             diagnostics.add(index, validation_error)
             continue
-        text = clean_text(_extract_structured_text(record, kind), lowercase=lowercase)
+        text = clean_code(_extract_structured_text(record, kind), lowercase=lowercase)
         if not text:
             diagnostics.add(index, "record contains no extractable text")
             continue
@@ -715,7 +715,7 @@ def load_structured_json_documents_with_diagnostics(
 ) -> StructuredDocumentLoad:
     """Load structured records while retaining source-level diagnostics."""
 
-    if kind not in {"conversation", "instruction", "tool_call"}:
+    if kind not in {"conversation", "instruction", "tool_call", "code"}:
         raise ValueError(f"Unsupported structured dataset kind: {kind}")
     path = Path(path)
     if not path.exists():
@@ -787,23 +787,30 @@ def _emit_json_diagnostics(
 
 
 def _structured_record_kind(record: Any) -> str:
-    if isinstance(record, dict) and any(
-        key in record for key in ("tool_calls", "tool_results", "tools")
-    ):
-        return "tool_call"
-    if isinstance(record, list) or (
-        isinstance(record, dict)
-        and any(
-            key in record
-            for key in (
-                "messages",
-                "conversations",
-                "dialogue",
-                "utterances",
-                "turns",
-            )
-        )
-    ):
+    if isinstance(record, dict):
+        if any(key in record for key in ("tool_calls", "tool_results", "tools")):
+            return "tool_call"
+        for m_key in ("messages", "conversations", "dialogue", "utterances", "turns"):
+            msg_list = record.get(m_key)
+            if isinstance(msg_list, list):
+                for m in msg_list:
+                    if isinstance(m, dict):
+                        role = str(m.get("role", m.get("from", ""))).lower()
+                        if role in {"tool", "function"} or "tool_calls" in m or "function_call" in m:
+                            return "tool_call"
+                        content = str(m.get("content", m.get("value", m.get("text", ""))))
+                        if "<CALL>" in content or "<tool_calls>" in content:
+                            return "tool_call"
+                return "conversation"
+    if isinstance(record, list):
+        for m in record:
+            if isinstance(m, dict):
+                role = str(m.get("role", m.get("from", ""))).lower()
+                if role in {"tool", "function"} or "tool_calls" in m or "function_call" in m:
+                    return "tool_call"
+                content = str(m.get("content", m.get("value", m.get("text", ""))))
+                if "<CALL>" in content or "<tool_calls>" in content:
+                    return "tool_call"
         return "conversation"
     return "instruction"
 
@@ -843,6 +850,35 @@ def _structured_record_error(record: Any, kind: str) -> str | None:
         if not any(record.get(key) is not None for key in ("messages", "tools", "tool_calls",
                                                             "tool_results", "prompt", "text", "content")):
             return "missing tools, messages, tool_calls, or text fields"
+    elif kind == "code":
+        if isinstance(record, dict):
+            value = record.get(
+                "messages",
+                record.get(
+                    "conversations",
+                    record.get("dialogue", record.get("utterances", record.get("turns"))),
+                ),
+            )
+            if value is not None and (not isinstance(value, list) or not value):
+                return "code messages must be a non-empty array"
+            if not any(
+                record.get(key) is not None
+                for key in (
+                    "messages",
+                    "code",
+                    "instruction",
+                    "input",
+                    "output",
+                    "response",
+                    "answer",
+                    "completion",
+                    "prompt",
+                    "question",
+                    "text",
+                    "content",
+                )
+            ):
+                return "missing code, messages, instruction/output, or text fields"
     return None
 
 

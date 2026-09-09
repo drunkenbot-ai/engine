@@ -98,7 +98,11 @@ def _format_message(message: Any) -> str:
     if not isinstance(calls, list) and isinstance(message.get("function_call"), dict):
         calls = [message["function_call"]]
     if isinstance(calls, list) and calls:
-        lines.append(_tool_calls_block(calls))
+        call_block = _tool_calls_block(calls)
+        if lines:
+            lines.append(call_block)
+        else:
+            lines = [f"{label}: {call_block}"]
     return "\n".join(lines)
 
 
@@ -167,6 +171,7 @@ def _is_tool_message(message: dict[str, Any]) -> bool:
         message.get("tool_calls")
         or message.get("function_call")
         or str(message.get("role", "")).lower() in {"tool", "function"}
+        or "<CALL>" in _text(message.get("content", ""))
     )
 
 
