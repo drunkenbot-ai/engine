@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 import torch
@@ -167,8 +167,8 @@ def _lora_target_names(model: nn.Module, target_modules: str) -> set[str]:
             continue
         if name.endswith("lm_head"):
             continue
-        is_attention = ".attn." in name
-        is_mlp = ".mlp." in name
+        is_attention = ".attn." in name or name.startswith("attn.") or ("attn" in name.split("."))
+        is_mlp = ".mlp." in name or name.startswith("mlp.") or ("mlp" in name.split("."))
         if ("attention" in groups and is_attention) or ("mlp" in groups and is_mlp):
             names.add(name)
     return names
