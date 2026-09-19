@@ -715,7 +715,7 @@ def load_structured_json_documents_with_diagnostics(
 ) -> StructuredDocumentLoad:
     """Load structured records while retaining source-level diagnostics."""
 
-    if kind not in {"conversation", "instruction", "tool_call", "code"}:
+    if kind not in {"conversation", "instruction", "tool_call", "code", "thinking"}:
         raise ValueError(f"Unsupported structured dataset kind: {kind}")
     path = Path(path)
     if not path.exists():
@@ -827,11 +827,11 @@ def _structured_record_error(record: Any, kind: str) -> str | None:
         if kind == "instruction":
             return "instruction records must be objects, not message arrays"
         return None
-    if kind == "conversation":
+    if kind in {"conversation", "thinking"}:
         value = record.get("messages", record.get("conversations", record.get("dialogue",
                          record.get("utterances", record.get("turns")))))
         if value is not None and (not isinstance(value, list) or not value):
-            return "conversation messages must be a non-empty array"
+            return f"{kind} messages must be a non-empty array"
         if value is None and "role" in record and not any(
                 record.get(key) for key in ("prompt", "question", "text", "body")
         ):

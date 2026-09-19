@@ -51,6 +51,13 @@ def _local_structured_dataset_paths(config: DatasetConfig) -> list[
         if key not in seen:
             seen.add(key)
             items.append((Path(path), "code", "local code"))
+    for path in [getattr(config, "thinking_dataset_path", None), *getattr(config, "thinking_dataset_paths", [])]:
+        if path is None or not str(path).strip():
+            continue
+        key = ("thinking", str(Path(path)))
+        if key not in seen:
+            seen.add(key)
+            items.append((Path(path), "thinking", "local thinking"))
     return items
 def _emit(
     progress: Optional[Callable[[Any], None]],

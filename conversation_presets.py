@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
@@ -222,6 +222,7 @@ def dataset_stage_label(stage: str) -> str:
         "conversation": "Conversation fine-tune",
         "code": "Code fine-tune",
         "tool_call": "Tool-call fine-tune",
+        "thinking": "Thinking fine-tune",
     }.get(stage, "Custom")
 
 
