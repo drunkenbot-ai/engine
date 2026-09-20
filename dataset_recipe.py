@@ -27,6 +27,9 @@ class RecipeCategory:
     source_paths: list[str] = field(default_factory=list)
     tokens_estimated: int = 0
     is_builtin: bool = True
+    files_count: int = 0
+    disk_bytes: int = 0
+    disk_tokens: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -42,6 +45,9 @@ class RecipeCategory:
             source_paths=[str(p) for p in data.get("source_paths", [])],
             tokens_estimated=int(data.get("tokens_estimated", 0)),
             is_builtin=bool(data.get("is_builtin", False)),
+            files_count=int(data.get("files_count", 0)),
+            disk_bytes=int(data.get("disk_bytes", 0)),
+            disk_tokens=int(data.get("disk_tokens", 0)),
         )
 
 
@@ -104,17 +110,67 @@ class DatasetRecipe:
         current_sum = self.total_percentage()
         diff = round(100.0 - current_sum, 2)
         if diff != 0.0 and unlocked:
-            unlocked[0].target_percentage = round(unlocked[0].target_percentage + diff, 2)
+            unlocked[0].target_percentage = round(max(0.0, unlocked[0].target_percentage + diff), 2)
+
+        self.recalculate_token_projections()
+
+    def rebalance_on_category_change(self, changed_slug: str, new_percentage: float) -> None:
+        """Dynamically rebalance unlocked categories when one category slider changes.
+
+        Locked categories and the changed category retain their exact values. Remaining unlocked
+        categories are scaled proportionally so the total sum is kept at exactly 100.0%.
+        """
+        changed_cat = self.get_category(changed_slug)
+        if not changed_cat or not changed_cat.enabled:
+            return
+
+        enabled = [c for c in self.categories if c.enabled]
+        locked = [c for c in enabled if c.locked and c.slug != changed_slug]
+        locked_sum = sum(c.target_percentage for c in locked)
+
+        max_allowed = max(0.0, 100.0 - locked_sum)
+        bounded_pct = max(0.0, min(max_allowed, round(new_percentage, 2)))
+        changed_cat.target_percentage = bounded_pct
+
+        other_unlocked = [c for c in enabled if not c.locked and c.slug != changed_slug]
+        if not other_unlocked:
+            self.recalculate_token_projections()
+            return
+
+        budget_remaining = max(0.0, 100.0 - locked_sum - bounded_pct)
+        other_current_sum = sum(c.target_percentage for c in other_unlocked)
+
+        if other_current_sum <= 0.0:
+            equal_share = budget_remaining / len(other_unlocked)
+            for c in other_unlocked:
+                c.target_percentage = round(equal_share, 2)
+        else:
+            scale = budget_remaining / other_current_sum
+            for c in other_unlocked:
+                c.target_percentage = round(c.target_percentage * scale, 2)
+
+        # Micro-rounding correction
+        current_sum = self.total_percentage()
+        diff = round(100.0 - current_sum, 2)
+        if diff != 0.0 and other_unlocked:
+            other_unlocked[0].target_percentage = round(
+                max(0.0, other_unlocked[0].target_percentage + diff), 2
+            )
+
+        self.recalculate_token_projections()
 
     def recalculate_token_projections(self, total_tokens: Optional[int] = None) -> None:
-        """Project token counts per category based on target mixture and total token budget."""
+        """Project token counts per category based on target mixture and total token budget.
+
+        Calculates exact target token quota = (target_percentage / 100.0) * total_target_tokens.
+        This guarantees locked categories retain constant token allocations when other categories change.
+        """
         if total_tokens is not None:
             self.total_target_tokens = total_tokens
 
-        tot_pct = max(self.total_percentage(), 0.0001)
         for c in self.categories:
             if c.enabled:
-                c.tokens_estimated = int(round((c.target_percentage / tot_pct) * self.total_target_tokens))
+                c.tokens_estimated = int(round((c.target_percentage / 100.0) * self.total_target_tokens))
             else:
                 c.tokens_estimated = 0
 
@@ -158,6 +214,69 @@ class DatasetRecipe:
             return None
 
 
+def resolve_category_directories(category: RecipeCategory, candidate_roots: list[Path]) -> list[Path]:
+    """Find all existing directory paths on disk for a given category."""
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+
+    for path_str in category.source_paths or [category.slug]:
+        p = Path(path_str)
+        if p.is_absolute() and p.is_dir():
+            res = p.resolve()
+            if res not in seen:
+                seen.add(res)
+                resolved.append(p)
+            continue
+
+        for root in candidate_roots:
+            if not root or not root.exists():
+                continue
+            candidate = (root / path_str).resolve()
+            if candidate.is_dir() and candidate not in seen:
+                seen.add(candidate)
+                resolved.append(candidate)
+
+    return resolved
+
+
+def scan_category_disk_stats(
+    category: RecipeCategory,
+    candidate_roots: list[Path],
+) -> dict[str, Any]:
+    """Scan disk folders for a category to report files count, total bytes, and estimated tokens."""
+    dirs = resolve_category_directories(category, candidate_roots)
+    all_files: list[Path] = []
+    supported_extensions = {
+        ".json", ".jsonl", ".txt", ".md", ".text", ".py", ".rs", ".go", ".c", ".cpp",
+        ".h", ".hpp", ".java", ".js", ".ts", ".tsx", ".jsx", ".cs", ".sh", ".ps1",
+        ".v", ".sv", ".vhd", ".vhdl"
+    }
+
+    for d in dirs:
+        try:
+            for p in d.rglob("*"):
+                if p.is_file() and p.suffix.lower() in supported_extensions and p.stat().st_size > 0:
+                    all_files.append(p)
+        except Exception as exc:
+            LOGGER.warning("Could not scan directory %s: %s", d, exc)
+
+    total_bytes = sum(f.stat().st_size for f in all_files)
+    # Average tokens in code/json/prose is ~3.85 bytes per token
+    estimated_tokens = int(round(total_bytes / 3.85))
+
+    category.files_count = len(all_files)
+    category.disk_bytes = total_bytes
+    category.disk_tokens = estimated_tokens
+
+    return {
+        "files_count": len(all_files),
+        "disk_bytes": total_bytes,
+        "disk_tokens": estimated_tokens,
+        "directories": dirs,
+        "files": all_files,
+    }
+
+
 # ==============================================================================
 # Built-In Recipe Presets
 # ==============================================================================
@@ -170,16 +289,17 @@ def create_frontier_11_pillar_recipe() -> DatasetRecipe:
         description="Comprehensive frontier pretraining foundation across code, math, hardware, cyber, science, and multilingual domains.",
         total_target_tokens=250_000_000,
         categories=[
-            RecipeCategory("Systems Code & Architecture", "code_pretraining", 25.0, source_paths=["code_pretraining"]),
+            RecipeCategory("Systems Code & Architecture", "code_pretraining", 22.0, source_paths=["code_pretraining"]),
             RecipeCategory("STEM & Formal Mathematics", "stem_pretraining", 12.0, source_paths=["stem_pretraining"]),
             RecipeCategory("Competitive Algorithms & Graphs", "algorithms_pretraining", 10.0, source_paths=["algorithms_pretraining"]),
             RecipeCategory("Hardware & Semiconductor RTL", "hardware_pretraining", 8.0, source_paths=["hardware_pretraining"]),
             RecipeCategory("Cybersecurity & Exploits", "cybersecurity_pretraining", 8.0, source_paths=["cybersecurity_pretraining"]),
-            RecipeCategory("Biomedicine & Life Sciences", "medicine_pretraining", 10.0, source_paths=["medicine_pretraining", "science_pretraining"]),
-            RecipeCategory("Quantitative Finance", "finance", 8.0, source_paths=["finance"]),
+            RecipeCategory("Biomedicine & Clinical Sciences", "medicine_pretraining", 8.0, source_paths=["medicine_pretraining"]),
+            RecipeCategory("Physical Sciences & Literature", "science_pretraining", 8.0, source_paths=["science_pretraining"]),
+            RecipeCategory("Quantitative Finance & Economics", "finance", 7.0, source_paths=["finance"]),
             RecipeCategory("Jurisprudence & Legal Reasoning", "law_pretraining", 6.0, source_paths=["law_pretraining"]),
-            RecipeCategory("Multilingual Cross-Alignment", "multilingual_pretraining", 8.0, source_paths=["multilingual_pretraining"]),
-            RecipeCategory("Encyclopedic & World Knowledge", "encyclopedic", 5.0, source_paths=["encyclopedic", "curated_2b_base"]),
+            RecipeCategory("Multilingual Cross-Alignment", "multilingual_pretraining", 6.0, source_paths=["multilingual_pretraining"]),
+            RecipeCategory("Encyclopedic Knowledge & Curated Docs", "encyclopedic", 5.0, source_paths=["encyclopedic", "curated_2b_base"]),
         ],
     )
 
