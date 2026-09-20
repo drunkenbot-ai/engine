@@ -363,8 +363,8 @@ def supported_source_paths(input_dir: Path, code_training_mode: bool = False, in
 
     Args:
         input_dir: Folder to scan.
-        code_training_mode: Whether source-code files are supported.
-        include_source_code: Whether to include source-code files.
+        code_training_mode: Legacy flag, retained for backwards compatibility.
+        include_source_code: Legacy flag, retained for backwards compatibility.
 
     Returns:
         Sorted supported paths.
@@ -377,12 +377,8 @@ def supported_source_paths(input_dir: Path, code_training_mode: bool = False, in
     if not input_dir.exists():
         raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
     paths = [path for path in sorted(input_dir.rglob("*")) if path.is_file()]
-    return [
-        path
-        for path in paths
-        if path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES | {".pdf", ".jsonl"}
-        or (code_training_mode and include_source_code and path.suffix.lower() in SUPPORTED_CODE_SUFFIXES)
-    ]
+    allowed = set(SUPPORTED_TEXT_SUFFIXES) | set(SUPPORTED_CODE_SUFFIXES.keys()) | {".pdf", ".json", ".jsonl"}
+    return [path for path in paths if path.suffix.lower() in allowed]
 
 
 def clean_text(text: str, lowercase: bool = False) -> str:
@@ -921,23 +917,20 @@ def read_supported_document(
     Args:
         path: Source file path.
         lowercase: Whether to lowercase loaded content.
-        code_training_mode: Whether code-specific handling is enabled.
-        preserve_indentation: Whether code line structure should be kept.
+        code_training_mode: Legacy flag, retained for backwards compatibility.
+        preserve_indentation: Legacy flag, retained for backwards compatibility.
 
     Returns:
         Loaded document, or ``None`` when the file has no useful text.
     """
 
     suffix = path.suffix.lower()
-    # Bundled code-training corpora may use .txt or .jsonl containers while
-    # still being intended for code-aware preparation.  Classify those files
-    # by their directory as well as by source-code extension.
     in_code_training_folder = any(
         part.lower() == "code_training" for part in path.parts
     )
-    if code_training_mode and suffix in SUPPORTED_CODE_SUFFIXES:
+    if suffix in SUPPORTED_CODE_SUFFIXES:
         text = path.read_text(encoding="utf-8", errors="ignore")
-        text = clean_code(text, lowercase=lowercase) if preserve_indentation else clean_text(text, lowercase=lowercase)
+        text = clean_code(text, lowercase=lowercase)
         if not text:
             return None
         return Document(path=path, text=text, kind="code", language=SUPPORTED_CODE_SUFFIXES[suffix])
@@ -950,7 +943,7 @@ def read_supported_document(
     else:
         return None
 
-    if in_code_training_folder and code_training_mode:
+    if in_code_training_folder:
         text = clean_code(text, lowercase=lowercase)
         if not text:
             return None

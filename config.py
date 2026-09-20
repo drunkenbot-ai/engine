@@ -64,10 +64,10 @@ class DatasetConfig:
     code_training_mode: bool = False
     include_prose: bool = True
     include_source_code: bool = True
-    extract_code_blocks: bool = True
+    extract_code_blocks: bool = False
     preserve_indentation: bool = True
-    generate_instruction_samples: bool = True
-    reasoning_sample_mode: str = "scaffold"
+    generate_instruction_samples: bool = False
+    reasoning_sample_mode: str = "none"
     prepare_mode: str = "incremental"
     tokenizer_strategy: str = "auto"
     tokenizer_path: Optional[Path] = None

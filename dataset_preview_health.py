@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -170,15 +170,13 @@ def check_project_health(
 
 def _supported_source_paths_cancellable(
     input_dir: Path,
-    code_training_mode: bool,
-    include_source_code: bool,
-    should_stop: Optional[Callable[[], bool]],
+    code_training_mode: bool = False,
+    include_source_code: bool = True,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> list[Path]:
     if not input_dir.exists():
         raise FileNotFoundError(f"Input folder does not exist: {input_dir}")
-    allowed = set(SUPPORTED_TEXT_SUFFIXES) | {".pdf", ".jsonl"}
-    if code_training_mode and include_source_code:
-        allowed |= set(SUPPORTED_CODE_SUFFIXES)
+    allowed = set(SUPPORTED_TEXT_SUFFIXES) | set(SUPPORTED_CODE_SUFFIXES.keys()) | {".pdf", ".json", ".jsonl"}
     paths: list[Path] = []
     for root, dirs, files in os.walk(input_dir):
         if should_stop and should_stop():

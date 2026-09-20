@@ -1,4 +1,4 @@
-﻿"""Standalone document extraction helpers, safe for worker processes.
+"""Standalone document extraction helpers, safe for worker processes.
 
 This module intentionally imports only from :mod:`.data`. ``dataset_build.py``
 (via ``.config``, ``.tokenizer``, ``.training``) pulls in ``torch`` and other
@@ -72,11 +72,11 @@ def bad_extraction_reasons(
 
 def extract_documents_worker(
     path: Path,
-    lowercase: bool,
-    code_training_mode: bool,
-    preserve_indentation: bool,
-    include_prose: bool,
-    extract_code_blocks: bool,
+    lowercase: bool = False,
+    code_training_mode: bool = False,
+    preserve_indentation: bool = True,
+    include_prose: bool = True,
+    extract_code_blocks: bool = False,
 ) -> dict[str, Any]:
     """Extract and expand one source file into documents.
 

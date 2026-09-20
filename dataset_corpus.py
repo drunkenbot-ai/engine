@@ -65,9 +65,9 @@ class _StreamingCorpusBuilder:
     def __init__(
         self,
         corpus_path: Path,
-        code_training_mode: bool,
-        generate_instruction_samples: bool,
-        reasoning_sample_mode: str,
+        code_training_mode: bool = False,
+        generate_instruction_samples: bool = False,
+        reasoning_sample_mode: str = "none",
         filter_low_diversity: bool = True,
     ) -> None:
         """Open the corpus file for streaming writes.
