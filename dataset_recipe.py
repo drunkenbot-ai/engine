@@ -252,9 +252,12 @@ def scan_category_disk_stats(
         ".v", ".sv", ".vhd", ".vhdl"
     }
 
+    ignored_parts = {"_quarantine", ".git", ".idea", "dist", "__pycache__"}
     for d in dirs:
         try:
             for p in d.rglob("*"):
+                if any(part in p.parts for part in ignored_parts):
+                    continue
                 if p.is_file() and p.suffix.lower() in supported_extensions and p.stat().st_size > 0:
                     all_files.append(p)
         except Exception as exc:
@@ -289,17 +292,17 @@ def create_frontier_11_pillar_recipe() -> DatasetRecipe:
         description="Comprehensive frontier pretraining foundation across code, math, hardware, cyber, science, and multilingual domains.",
         total_target_tokens=250_000_000,
         categories=[
-            RecipeCategory("Systems Code & Architecture", "code_pretraining", 22.0, source_paths=["code_pretraining"]),
-            RecipeCategory("STEM & Formal Mathematics", "stem_pretraining", 12.0, source_paths=["stem_pretraining"]),
+            RecipeCategory("Encyclopedic & Science", "encyclopedic", 25.0, source_paths=["encyclopedic", "science_pretraining", "clean_subject_corpora"]),
+            RecipeCategory("Systems Code & Architecture", "code_pretraining", 15.0, source_paths=["code_pretraining"]),
             RecipeCategory("Competitive Algorithms & Graphs", "algorithms_pretraining", 10.0, source_paths=["algorithms_pretraining"]),
+            RecipeCategory("STEM & Formal Mathematics", "stem_pretraining", 10.0, source_paths=["stem_pretraining"]),
+            RecipeCategory("Biomedicine & Clinical Sciences", "medicine_pretraining", 10.0, source_paths=["medicine_pretraining"]),
             RecipeCategory("Hardware & Semiconductor RTL", "hardware_pretraining", 8.0, source_paths=["hardware_pretraining"]),
-            RecipeCategory("Cybersecurity & Exploits", "cybersecurity_pretraining", 8.0, source_paths=["cybersecurity_pretraining"]),
-            RecipeCategory("Biomedicine & Clinical Sciences", "medicine_pretraining", 8.0, source_paths=["medicine_pretraining"]),
-            RecipeCategory("Physical Sciences & Literature", "science_pretraining", 8.0, source_paths=["science_pretraining"]),
-            RecipeCategory("Quantitative Finance & Economics", "finance", 7.0, source_paths=["finance"]),
-            RecipeCategory("Jurisprudence & Legal Reasoning", "law_pretraining", 6.0, source_paths=["law_pretraining"]),
-            RecipeCategory("Multilingual Cross-Alignment", "multilingual_pretraining", 6.0, source_paths=["multilingual_pretraining"]),
-            RecipeCategory("Encyclopedic Knowledge & Curated Docs", "encyclopedic", 5.0, source_paths=["encyclopedic", "curated_2b_base"]),
+            RecipeCategory("Cybersecurity & Exploits", "cybersecurity_pretraining", 7.0, source_paths=["cybersecurity_pretraining"]),
+            RecipeCategory("Quantitative Finance & Economics", "finance", 5.0, source_paths=["finance"]),
+            RecipeCategory("Jurisprudence & Legal Reasoning", "law_pretraining", 4.0, source_paths=["law_pretraining"]),
+            RecipeCategory("Multilingual Cross-Alignment", "multilingual_pretraining", 3.0, source_paths=["multilingual_pretraining"]),
+            RecipeCategory("Multi-Turn Reasoning & Dialogue", "fine_tune_conversation", 3.0, source_paths=["fine_tune_conversation"]),
         ],
     )
 
