@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -34,7 +34,8 @@ class MicroGPT(nn.Module):
         self.ln_f = make_norm(config)
         self.lm_head = nn.Linear(config.embedding_size, config.vocab_size, bias=False)
         self.gradient_checkpointing = False
-        self.token_embedding.weight = self.lm_head.weight
+        if getattr(config, "tie_word_embeddings", True):
+            self.token_embedding.weight = self.lm_head.weight
         self.apply(self._init_weights)
 
     def enable_gradient_checkpointing(self, enabled: bool = True) -> None:

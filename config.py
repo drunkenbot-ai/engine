@@ -138,6 +138,7 @@ class ModelConfig:
     kv_head_count: int = 0
     attention_backend: str = "sdpa"
     attention_window: int = 0
+    tie_word_embeddings: bool = True
 
     def validate(self) -> None:
         """Validate architecture constraints.
