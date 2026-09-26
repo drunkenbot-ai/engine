@@ -284,42 +284,25 @@ def scan_category_disk_stats(
 # Built-In Recipe Presets
 # ==============================================================================
 
-def create_frontier_11_pillar_recipe() -> DatasetRecipe:
-    """The gold-standard balanced 11-pillar mixture (250M tokens) for frontier models."""
+def create_frontier_11_pillar_recipe(target_tokens: int = 1_000_000_000) -> DatasetRecipe:
+    """The gold-standard balanced 11-pillar mixture for frontier models (scalable up to 1B+ tokens)."""
     return DatasetRecipe(
         recipe_id="frontier_11_pillar",
         name="Default 11-Pillar Frontier Base",
         description="Comprehensive frontier pretraining foundation across code, math, hardware, cyber, science, and multilingual domains.",
-        total_target_tokens=250_000_000,
+        total_target_tokens=target_tokens,
         categories=[
-            RecipeCategory("Encyclopedic & Science", "encyclopedic", 25.0, source_paths=["encyclopedic", "science_pretraining", "clean_subject_corpora"]),
+            RecipeCategory("Encyclopedic & Science", "encyclopedic", 25.0, source_paths=["encyclopedic", "science_pretraining", "clean_subject_corpora", "fineweb_edu"]),
             RecipeCategory("Systems Code & Architecture", "code_pretraining", 15.0, source_paths=["code_pretraining"]),
             RecipeCategory("Competitive Algorithms & Graphs", "algorithms_pretraining", 10.0, source_paths=["algorithms_pretraining"]),
-            RecipeCategory("STEM & Formal Mathematics", "stem_pretraining", 10.0, source_paths=["stem_pretraining"]),
+            RecipeCategory("STEM & Formal Mathematics", "stem_pretraining", 10.0, source_paths=["stem_pretraining", "open_web_math"]),
             RecipeCategory("Biomedicine & Clinical Sciences", "medicine_pretraining", 10.0, source_paths=["medicine_pretraining"]),
             RecipeCategory("Hardware & Semiconductor RTL", "hardware_pretraining", 8.0, source_paths=["hardware_pretraining"]),
             RecipeCategory("Cybersecurity & Exploits", "cybersecurity_pretraining", 7.0, source_paths=["cybersecurity_pretraining"]),
             RecipeCategory("Quantitative Finance & Economics", "finance", 5.0, source_paths=["finance"]),
             RecipeCategory("Jurisprudence & Legal Reasoning", "law_pretraining", 4.0, source_paths=["law_pretraining"]),
             RecipeCategory("Multilingual Cross-Alignment", "multilingual_pretraining", 3.0, source_paths=["multilingual_pretraining"]),
-            RecipeCategory("Multi-Turn Reasoning & Dialogue", "fine_tune_conversation", 3.0, source_paths=["fine_tune_conversation"]),
-        ],
-    )
-
-
-def create_frontier_1b_curriculum_recipe() -> DatasetRecipe:
-    """The 12B token production curriculum engineered to produce a 1B frontier model."""
-    return DatasetRecipe(
-        recipe_id="frontier_1b_curriculum",
-        name="Frontier 1B Model Curriculum (12B Tokens)",
-        description="High-density Chinchilla-grade curriculum: 40% FineWeb-Edu, 25% Systems Code, 15% Math & STEM, 10% Encyclopedic, 10% Professional Domains.",
-        total_target_tokens=12_000_000_000,
-        categories=[
-            RecipeCategory("Educational Web & Reasoning", "fineweb_edu", 40.0, source_paths=["fineweb_edu", "clean_subject_corpora"]),
-            RecipeCategory("Systems Code & Architecture", "code_pretraining", 25.0, source_paths=["code_pretraining", "algorithms_pretraining"]),
-            RecipeCategory("STEM & Formal Mathematics", "stem_pretraining", 15.0, source_paths=["stem_pretraining", "science_pretraining"]),
-            RecipeCategory("Encyclopedic & World Knowledge", "encyclopedic", 10.0, source_paths=["encyclopedic"]),
-            RecipeCategory("Professional Domains (Med, Law, Hardware)", "professional_domains", 10.0, source_paths=["medicine_pretraining", "law_pretraining", "hardware_pretraining", "cybersecurity_pretraining", "finance"]),
+            RecipeCategory("Multi-Turn Reasoning & Dialogue", "fine_tune_conversation", 3.0, source_paths=["fine_tune_conversation", "fine_tune_thinking"]),
         ],
     )
 
@@ -389,7 +372,6 @@ def create_balanced_tiny_recipe() -> DatasetRecipe:
 
 DEFAULT_RECIPE_PRESETS: dict[str, DatasetRecipe] = {
     "frontier_11_pillar": create_frontier_11_pillar_recipe(),
-    "frontier_1b_curriculum": create_frontier_1b_curriculum_recipe(),
     "code_heavy": create_code_heavy_recipe(),
     "stem_reasoning": create_stem_reasoning_recipe(),
     "balanced_tiny": create_balanced_tiny_recipe(),
