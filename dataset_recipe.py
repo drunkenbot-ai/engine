@@ -307,6 +307,23 @@ def create_frontier_11_pillar_recipe() -> DatasetRecipe:
     )
 
 
+def create_frontier_1b_curriculum_recipe() -> DatasetRecipe:
+    """The 12B token production curriculum engineered to produce a 1B frontier model."""
+    return DatasetRecipe(
+        recipe_id="frontier_1b_curriculum",
+        name="Frontier 1B Model Curriculum (12B Tokens)",
+        description="High-density Chinchilla-grade curriculum: 40% FineWeb-Edu, 25% Systems Code, 15% Math & STEM, 10% Encyclopedic, 10% Professional Domains.",
+        total_target_tokens=12_000_000_000,
+        categories=[
+            RecipeCategory("Educational Web & Reasoning", "fineweb_edu", 40.0, source_paths=["fineweb_edu", "clean_subject_corpora"]),
+            RecipeCategory("Systems Code & Architecture", "code_pretraining", 25.0, source_paths=["code_pretraining", "algorithms_pretraining"]),
+            RecipeCategory("STEM & Formal Mathematics", "stem_pretraining", 15.0, source_paths=["stem_pretraining", "science_pretraining"]),
+            RecipeCategory("Encyclopedic & World Knowledge", "encyclopedic", 10.0, source_paths=["encyclopedic"]),
+            RecipeCategory("Professional Domains (Med, Law, Hardware)", "professional_domains", 10.0, source_paths=["medicine_pretraining", "law_pretraining", "hardware_pretraining", "cybersecurity_pretraining", "finance"]),
+        ],
+    )
+
+
 def create_code_heavy_recipe() -> DatasetRecipe:
     """Specialist mixture weighted heavily toward systems code, algorithms, and hardware."""
     return DatasetRecipe(
@@ -372,6 +389,7 @@ def create_balanced_tiny_recipe() -> DatasetRecipe:
 
 DEFAULT_RECIPE_PRESETS: dict[str, DatasetRecipe] = {
     "frontier_11_pillar": create_frontier_11_pillar_recipe(),
+    "frontier_1b_curriculum": create_frontier_1b_curriculum_recipe(),
     "code_heavy": create_code_heavy_recipe(),
     "stem_reasoning": create_stem_reasoning_recipe(),
     "balanced_tiny": create_balanced_tiny_recipe(),
