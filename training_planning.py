@@ -163,7 +163,7 @@ def optimize_training_hyperparameters(
 
     Args:
         model_config: Model architecture configuration.
-        target_vram_gb: Target available VRAM in gigabytes (e.g. 16.0).
+        target_vram_gb: Target available VRAM in gigabytes (e.g. 8.0, 12.0, 16.0, 24.0, 48.0).
         train_tokens: Total tokens available in the prepared dataset.
         training_mode: "pretrain" or "fine_tune" / specialized fine-tuning modes.
         cpu_count: Number of CPU worker cores available.
@@ -250,13 +250,15 @@ def optimize_training_hyperparameters(
     #   >= 3B params: ~262K - 524K tokens
     # Fine-tuning: ~32K - 65K tokens
     if is_fine_tune:
-        target_effective_tokens = 32768 if target_vram <= 16.0 else 65536
-    elif params < 500_000_000:
-        target_effective_tokens = 65536 if target_vram <= 8.0 else 131072
+        target_effective_tokens = 65536 if target_vram >= 24.0 else 32768
+    elif params < 300_000_000:
+        target_effective_tokens = 65536 if target_vram < 10.0 else 131072
+    elif params < 1_500_000_000:
+        target_effective_tokens = 131072 if target_vram < 20.0 else 262144
     elif params < 3_000_000_000:
-        target_effective_tokens = 131072 if target_vram <= 16.0 else 262144
+        target_effective_tokens = 262144 if target_vram < 32.0 else 524288
     else:
-        target_effective_tokens = 262144
+        target_effective_tokens = 524288
 
     tokens_per_micro_step = max(1, batch_size * seq_len)
     raw_accum = max(1, round(target_effective_tokens / tokens_per_micro_step))
