@@ -190,12 +190,15 @@ def optimize_training_hyperparameters(
 
     # 3. Memory per activation sample during backward pass
     # Under PyTorch AMP + activation checkpointing, recomputing one transformer block
-    # plus attention logits and PyTorch caching allocator requires ~ 5.6 * seq_len * emb * layers bytes.
+    # plus attention activations and PyTorch caching allocator requires ~ 5.6 * seq_len * emb * layers bytes.
     # Without checkpointing, storing intermediate forward states takes ~ 14.0 * seq_len * emb * layers bytes.
+    vocab_sz = int(getattr(model_config, "vocab_size", 50257) or 50257)
+    # Output logits tensor [seq_len, vocab_size] in FP16/BF16 (2 bytes per token)
+    logits_bytes_per_sample = int(seq_len * max(vocab_sz, 256) * 2)
     if activation_checkpointing:
-        act_bytes_per_sample = max(2 * 1024 * 1024, int(5.6 * seq_len * emb * layers))
+        act_bytes_per_sample = max(2 * 1024 * 1024, int(5.6 * seq_len * emb * layers) + logits_bytes_per_sample)
     else:
-        act_bytes_per_sample = max(5 * 1024 * 1024, int(14.0 * seq_len * emb * layers))
+        act_bytes_per_sample = max(5 * 1024 * 1024, int(14.0 * seq_len * emb * layers) + logits_bytes_per_sample)
 
     # 4. Weight and optimizer memory calculation
     # In mixed precision: 2 bytes/weight.
@@ -220,33 +223,38 @@ def optimize_training_hyperparameters(
             optimizer_name = "AdamW"
             static_memory_bytes = full_opt_bytes
 
-    # Target 88% usable VRAM headroom to maximize utilization of 16GB+ hardware without OOMing
+    # Target 85-88% usable VRAM headroom to maximize utilization of available hardware without OOMing or TDR
     target_usable_bytes = int(target_vram * (1024 ** 3) * 0.88)
     avail_act_bytes = max(act_bytes_per_sample, target_usable_bytes - static_memory_bytes - cuda_overhead_bytes)
 
-    # 5. Micro-Batch Size Selection (granular descent to fill available headroom)
+    # 5. Micro-Batch Size Selection (granular descent to safely fill available headroom)
+    # Cap maximum tokens per micro-batch on CUDA to 49,152 (e.g. max 24 at ctx 2048)
+    # This prevents Windows WDDM driver watchdog (TDR) timeouts and illegal memory access exceptions
+    max_kernel_tokens = 49152 if device_type.startswith("cuda") else 32768
+    max_safe_batch = max(1, max_kernel_tokens // max(seq_len, 1))
+
     candidate_batches = [
-        256, 192, 160, 128, 112, 96, 80, 64, 48, 32, 24, 16, 12, 8, 4, 2, 1
+        64, 48, 40, 32, 28, 24, 20, 16, 12, 8, 6, 4, 2, 1
     ]
     batch_size = 1
     for cand in candidate_batches:
-        if cand * act_bytes_per_sample <= avail_act_bytes:
+        if cand <= max_safe_batch and (cand * act_bytes_per_sample) <= avail_act_bytes:
             batch_size = cand
             break
 
     # 6. Global Batch Size & Gradient Accumulation
     # LLM quality relies on a healthy effective token batch size:
     # Pre-training:
-    #   < 500M params: ~32K - 65K tokens
-    #   500M - 3B params: ~65K - 131K tokens
-    #   >= 3B params: ~131K - 262K tokens
-    # Fine-tuning: ~16K - 32K tokens
+    #   < 500M params: ~65K - 131K tokens
+    #   500M - 3B params: ~131K - 262K tokens
+    #   >= 3B params: ~262K - 524K tokens
+    # Fine-tuning: ~32K - 65K tokens
     if is_fine_tune:
-        target_effective_tokens = 16384 if target_vram <= 16.0 else 32768
+        target_effective_tokens = 32768 if target_vram <= 16.0 else 65536
     elif params < 500_000_000:
-        target_effective_tokens = 65536
+        target_effective_tokens = 65536 if target_vram <= 8.0 else 131072
     elif params < 3_000_000_000:
-        target_effective_tokens = 131072
+        target_effective_tokens = 131072 if target_vram <= 16.0 else 262144
     else:
         target_effective_tokens = 262144
 
