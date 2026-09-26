@@ -135,3 +135,158 @@ def stream_dataset_to_partitions(
             progress_callback(writer.total_tokens_estimated, target_tokens)
 
     return writer.close()
+
+
+FRONTIER_SOURCE_PRESETS: dict[str, dict[str, Any]] = {
+    "fineweb_edu": {
+        "dataset_name": "HuggingFaceFW/fineweb-edu",
+        "subset": "sample-10BT",
+        "split": "train",
+        "text_key": "text",
+        "prefix": "fineweb_edu",
+        "filter_fn": lambda r: r.get("score", 5.0) is None or float(r.get("score", 5.0)) >= 3.0,
+    },
+    "open_web_math": {
+        "dataset_name": "open-web-math/open-web-math",
+        "subset": None,
+        "split": "train",
+        "text_key": "text",
+        "prefix": "open_web_math",
+        "filter_fn": None,
+    },
+    "starcoder2": {
+        "dataset_name": "bigcode/the-stack-smol",
+        "subset": "data",
+        "split": "train",
+        "text_key": "content",
+        "prefix": "starcoder2",
+        "filter_fn": None,
+    },
+    "wikipedia": {
+        "dataset_name": "wikimedia/wikipedia",
+        "subset": "20231101.en",
+        "split": "train",
+        "text_key": "text",
+        "prefix": "wikipedia_en",
+        "filter_fn": None,
+    },
+}
+
+
+def stream_hf_dataset(
+    preset_or_name: str,
+    output_dir: Path,
+    target_tokens: int = 50_000_000,
+    subset: Optional[str] = None,
+    split: str = "train",
+    text_key: str = "text",
+    prefix: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> dict[str, Any]:
+    """Stream records from a HuggingFace dataset into cluster-ready 28MB shards.
+
+    Args:
+        preset_or_name: Either a preset slug ('fineweb_edu', 'open_web_math', etc.) or HF dataset name.
+        output_dir: Target directory for partition JSONL files.
+        target_tokens: Ingestion token ceiling.
+        subset: HF dataset configuration name.
+        split: Dataset split to stream.
+        text_key: Column holding text content.
+        prefix: Shard filename prefix.
+        progress_callback: Progress reporting callable.
+
+    Returns:
+        Manifest dictionary.
+    """
+    import datasets
+
+    filter_fn = None
+    if preset_or_name in FRONTIER_SOURCE_PRESETS:
+        cfg = FRONTIER_SOURCE_PRESETS[preset_or_name]
+        ds_name = cfg["dataset_name"]
+        subset = subset or cfg["subset"]
+        split = split or cfg["split"]
+        text_key = cfg["text_key"]
+        prefix = prefix or cfg["prefix"]
+        filter_fn = cfg["filter_fn"]
+    else:
+        ds_name = preset_or_name
+        prefix = prefix or "part"
+
+    LOGGER.info("Connecting stream to %s (subset=%s, split=%s)...", ds_name, subset, split)
+    ds = datasets.load_dataset(ds_name, name=subset, split=split, streaming=True)
+
+    def extract_text(raw: dict[str, Any]) -> str:
+        if filter_fn and not filter_fn(raw):
+            return ""
+        val = raw.get(text_key, "")
+        return str(val) if val else ""
+
+    return stream_dataset_to_partitions(
+        records_iterable=ds,
+        output_dir=Path(output_dir),
+        prefix=prefix,
+        target_tokens=target_tokens,
+        text_extractor=extract_text,
+        progress_callback=progress_callback,
+    )
+
+
+def main() -> None:
+    """CLI entrypoint for streaming frontier tokens directly into partitioned shards."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Stream frontier datasets into cluster-safe 28MB shards.")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="fineweb_edu",
+        choices=list(FRONTIER_SOURCE_PRESETS.keys()),
+        help="Dataset preset to stream.",
+    )
+    parser.add_argument(
+        "--target-tokens",
+        type=str,
+        default="50M",
+        help="Target tokens to stream (e.g. 10M, 50M, 1B, 12B).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="E:/AI_Projects/dataset/fineweb_edu",
+        help="Destination directory for 28MB shards.",
+    )
+
+    args = parser.parse_args()
+
+    # Parse target tokens shorthand
+    val_str = args.target_tokens.strip().upper()
+    if val_str.endswith("B"):
+        tokens = int(float(val_str[:-1]) * 1_000_000_000)
+    elif val_str.endswith("M"):
+        tokens = int(float(val_str[:-1]) * 1_000_000)
+    elif val_str.endswith("K"):
+        tokens = int(float(val_str[:-1]) * 1_000)
+    else:
+        tokens = int(val_str)
+
+    print(f"[*] Starting streaming ingestion for preset '{args.preset}' -> {args.output_dir}")
+    print(f"[*] Target token ceiling: {tokens:,} tokens")
+
+    def report_progress(current: int, target: int) -> None:
+        pct = (current / max(target, 1)) * 100
+        print(f"  -> Progress: {current:,} / {target:,} tokens ({pct:.1f}%)")
+
+    manifest = stream_hf_dataset(
+        args.preset,
+        output_dir=Path(args.output_dir),
+        target_tokens=tokens,
+        progress_callback=report_progress,
+    )
+    print("\n[+] Streaming Ingestion Complete!")
+    print(json.dumps(manifest, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+

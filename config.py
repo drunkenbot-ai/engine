@@ -264,6 +264,7 @@ class TrainingConfig:
     gradient_accumulation: int = 1
     sample_stride: int = 128 #1
     warmup_steps: int = 100
+    annealing_steps: int = 0
     eval_interval: int = 100
     max_eval_batches: int = 50
     save_interval: int = 500

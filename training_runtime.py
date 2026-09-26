@@ -514,11 +514,22 @@ def make_scheduler(
     warmup_steps = min(warmup_steps, max(total_steps - 1, 1))
     min_ratio = training_config.scheduler_min_lr_ratio
     schedule = training_config.scheduler_name
+    annealing_steps = getattr(training_config, "annealing_steps", 0)
+
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return max(step, 1) / max(warmup_steps, 1)
         if schedule == "constant":
             return 1.0
+        if annealing_steps > 0 and step >= (total_steps - annealing_steps):
+            # Curriculum annealing cooldown phase: steep ramp down to min_ratio
+            anneal_prog = (step - (total_steps - annealing_steps)) / max(annealing_steps, 1)
+            anneal_prog = max(0.0, min(anneal_prog, 1.0))
+            start_anneal_step = total_steps - annealing_steps
+            base_prog = (start_anneal_step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            base_prog = max(0.0, min(base_prog, 1.0))
+            start_lr_mult = min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * base_prog))
+            return min_ratio + (start_lr_mult - min_ratio) * (1.0 - anneal_prog)
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
         progress = max(0.0, min(progress, 1.0))
         if schedule == "cosine":

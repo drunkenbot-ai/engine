@@ -1,5 +1,6 @@
 from __future__ import annotations
 import hashlib
+import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -157,7 +158,7 @@ class _StreamingCorpusBuilder:
         """Compute a compact 16-hash MinHash signature from character 5-grams."""
         if len(text) < 60:
             return ()
-        shingles = {hash(text[i : i + 5]) & 0xFFFFFFFF for i in range(0, min(len(text) - 4, 1200), 2)}
+        shingles = {zlib.crc32(text[i : i + 5].encode("utf-8")) for i in range(0, min(len(text) - 4, 1200), 2)}
         if len(shingles) < 8:
             return ()
         sig = []
