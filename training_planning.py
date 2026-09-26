@@ -345,6 +345,10 @@ def optimize_training_hyperparameters(
         f"VRAM est {est_peak_gb}GB / {target_vram:.0f}GB ({optimizer_name})"
     )
 
+    # Annealing schedule (frontier standard):
+    # Dedicate the final 10-15% of steps to steep learning rate cooldown and high-density reasoning
+    annealing_steps = max(0, int(0.12 * total_steps)) if (not is_fine_tune and total_steps >= 500) else 0
+
     return {
         "batch_size": batch_size,
         "gradient_accumulation": gradient_accumulation,
@@ -353,6 +357,7 @@ def optimize_training_hyperparameters(
         "steps_per_epoch": steps_per_epoch,
         "total_steps": total_steps,
         "warmup_steps": warmup_steps,
+        "annealing_steps": annealing_steps,
         "eval_interval": eval_interval,
         "max_eval_batches": max_eval_batches,
         "save_interval": save_interval,
