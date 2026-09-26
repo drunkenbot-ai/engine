@@ -37,6 +37,8 @@ class _CorpusBuildStats:
     source_files_truncated: bool = False
     exact_duplicates_removed: int = 0
     exact_duplicate_examples: list[dict[str, str]] = field(default_factory=list)
+    prefix_duplicates_removed: int = 0
+    near_duplicates_removed: int = 0
     low_diversity_removed: int = 0
     low_diversity_removed_characters: int = 0
     low_diversity_examples: list[dict[str, Any]] = field(default_factory=list)
@@ -69,6 +71,8 @@ class _StreamingCorpusBuilder:
         generate_instruction_samples: bool = False,
         reasoning_sample_mode: str = "none",
         filter_low_diversity: bool = True,
+        filter_near_duplicates: bool = True,
+        max_prefix_repeats: int = 50,
     ) -> None:
         """Open the corpus file for streaming writes.
 
@@ -80,13 +84,19 @@ class _StreamingCorpusBuilder:
             reasoning_sample_mode: Instruction/reasoning style for code
                 samples.
             filter_low_diversity: Whether to exclude low-diversity repetitive documents.
+            filter_near_duplicates: Whether to exclude MinHash/LSH near-duplicates.
+            max_prefix_repeats: Maximum allowed occurrences of identical document prefixes.
         """
 
         self._code_training_mode = code_training_mode
         self._generate_instruction_samples = generate_instruction_samples
         self._reasoning_sample_mode = reasoning_sample_mode
         self._filter_low_diversity = filter_low_diversity
+        self._filter_near_duplicates = filter_near_duplicates
+        self._max_prefix_repeats = max_prefix_repeats
         self._seen_digests: dict[str, str] = {}
+        self._prefix_counts: Counter = Counter()
+        self._lsh_index: dict[tuple[int, tuple[int, ...]], int] = {}
         self.stats = _CorpusBuildStats()
         corpus_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = corpus_path.open("w", encoding="utf-8")
@@ -124,7 +134,70 @@ class _StreamingCorpusBuilder:
                 )
             return
 
+        # Check prefix boilerplate throttling (e.g. repeated synthetic prompts)
+        if self._filter_near_duplicates and len(canonical) >= 48:
+            prefix_sig = canonical[:48]
+            self._prefix_counts[prefix_sig] += 1
+            if self._prefix_counts[prefix_sig] > self._max_prefix_repeats:
+                self.stats.prefix_duplicates_removed += 1
+                return
+
+        # Check MinHash LSH near-duplicate similarity
+        if self._filter_near_duplicates:
+            minhash_sig = self._compute_minhash(canonical)
+            if minhash_sig:
+                if self._is_minhash_duplicate(minhash_sig, len(canonical)):
+                    self.stats.near_duplicates_removed += 1
+                    return
+                self._record_minhash(minhash_sig, len(canonical))
+
         self._accept(document, canonical)
+
+    def _compute_minhash(self, text: str) -> tuple[int, ...]:
+        """Compute a compact 16-hash MinHash signature from character 5-grams."""
+        if len(text) < 60:
+            return ()
+        shingles = {hash(text[i : i + 5]) & 0xFFFFFFFF for i in range(0, min(len(text) - 4, 1200), 2)}
+        if len(shingles) < 8:
+            return ()
+        sig = []
+        for i in range(16):
+            a = 1664525 * (i + 1) + 1013904223
+            b = 22695477 * (i + 1) + 1
+            min_val = min(((a * h + b) & 0xFFFFFFFF) for h in shingles)
+            sig.append(min_val)
+        return tuple(sig)
+
+    def _is_minhash_duplicate(self, sig: tuple[int, ...], length: int) -> bool:
+        """Check if at least 3 of 4 bands match an existing document with comparable length."""
+        bands = [
+            (0, sig[0:4]),
+            (1, sig[4:8]),
+            (2, sig[8:12]),
+            (3, sig[12:16]),
+        ]
+        matching_bands = 0
+        for band_idx, band_val in bands:
+            key = (band_idx, band_val)
+            prev_len = self._lsh_index.get(key)
+            if prev_len is not None:
+                len_ratio = min(length, prev_len) / max(length, prev_len)
+                if len_ratio >= 0.70:
+                    matching_bands += 1
+        return matching_bands >= 3
+
+    def _record_minhash(self, sig: tuple[int, ...], length: int) -> None:
+        """Store LSH band keys for near-duplicate lookup."""
+        bands = [
+            (0, sig[0:4]),
+            (1, sig[4:8]),
+            (2, sig[8:12]),
+            (3, sig[12:16]),
+        ]
+        for band_idx, band_val in bands:
+            key = (band_idx, band_val)
+            if key not in self._lsh_index:
+                self._lsh_index[key] = length
 
     @staticmethod
     def _is_low_diversity(document: Document) -> bool:
@@ -215,6 +288,8 @@ class _StreamingCorpusBuilder:
             "duplicate_block_ratio": duplicate_ratio,
             "unique_block_ratio": unique_ratio,
             "ignored_block_count": stats.block_ignored,
+            "prefix_duplicates_removed": stats.prefix_duplicates_removed,
+            "near_duplicates_removed": stats.near_duplicates_removed,
             "truncated": False,
             "most_repeated_block_count": repeated[0]["count"] if repeated else 1,
             "top_repeated_blocks": repeated,

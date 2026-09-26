@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import re
 from typing import Any, Optional
 
@@ -145,6 +145,10 @@ def _dataset_quality_report(
         reasons.append("Prepared corpus has some repeated blocks.")
     else:
         reasons.append("Prepared corpus block diversity looks healthy.")
+    prefix_dups = int(duplicate_report.get("prefix_duplicates_removed", 0) or 0)
+    near_dups = int(duplicate_report.get("near_duplicates_removed", 0) or 0)
+    if prefix_dups or near_dups:
+        reasons.append(f"Filtered {prefix_dups + near_dups:,} synthetic/boilerplate near-duplicate records to protect model diversity.")
     if warning and warning != "none":
         reasons.append(str(warning))
     return {

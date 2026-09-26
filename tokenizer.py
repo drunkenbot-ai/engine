@@ -26,6 +26,11 @@ ROLE_TOKENS = [
 REASONING_TOKENS = [
     "<thought>",
     "</thought>",
+    "<think>",
+    "</think>",
+]
+DOCUMENT_TOKENS = [
+    "<|endoftext|>",
 ]
 TOOL_TOKENS = [
     "<tools>",
@@ -38,7 +43,7 @@ TOOL_TOKENS = [
     "</CALL>",
     *REASONING_TOKENS,
 ]
-SPECIAL_TOKENS = [PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN, *ROLE_TOKENS, *TOOL_TOKENS]
+SPECIAL_TOKENS = [PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN, *ROLE_TOKENS, *DOCUMENT_TOKENS, *TOOL_TOKENS]
 DEFAULT_CHAT_TEMPLATE = """{% for message in messages %}{{ '<bos>' if loop.first else '' }}{{ message['role'] | capitalize }}: {{ message['content'] }}{{ '<eos>' if loop.last else '\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '\\nAssistant:' }}{% endif %}"""
 CHATML_CHAT_TEMPLATE = """{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"""
 MAX_TOKENIZER_LINE_CHARS = 8_192
