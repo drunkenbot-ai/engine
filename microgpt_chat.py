@@ -13,6 +13,7 @@ from inference.core.microgpt_chat import (
     load_microgpt_chat_session,
     stream_microgpt_chat_reply,
 )
+from engine.tokenizer import load_tokenizer
 
 __all__ = [
     "STOP_SEQUENCES",
@@ -20,4 +21,5 @@ __all__ = [
     "_resolve_model_checkpoint",
     "load_microgpt_chat_session",
     "stream_microgpt_chat_reply",
+    "load_tokenizer",
 ]

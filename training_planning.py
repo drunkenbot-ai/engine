@@ -189,8 +189,13 @@ def optimize_training_hyperparameters(
     activation_checkpointing = True
 
     # 3. Memory per activation sample during backward pass
-    # With activation checkpointing: ~ 2 * seq_len * emb * layers bytes
-    act_bytes_per_sample = max(1024 * 1024, 2 * seq_len * emb * layers)
+    # Under PyTorch AMP + activation checkpointing, recomputing one transformer block
+    # plus attention logits and PyTorch caching allocator requires ~ 5.6 * seq_len * emb * layers bytes.
+    # Without checkpointing, storing intermediate forward states takes ~ 14.0 * seq_len * emb * layers bytes.
+    if activation_checkpointing:
+        act_bytes_per_sample = max(2 * 1024 * 1024, int(5.6 * seq_len * emb * layers))
+    else:
+        act_bytes_per_sample = max(5 * 1024 * 1024, int(14.0 * seq_len * emb * layers))
 
     # 4. Weight and optimizer memory calculation
     # In mixed precision: 2 bytes/weight.
@@ -215,14 +220,17 @@ def optimize_training_hyperparameters(
             optimizer_name = "AdamW"
             static_memory_bytes = full_opt_bytes
 
-    avail_act_bytes = int(target_vram * (1024 ** 3)) - static_memory_bytes - cuda_overhead_bytes
+    # Target 88% usable VRAM headroom to maximize utilization of 16GB+ hardware without OOMing
+    target_usable_bytes = int(target_vram * (1024 ** 3) * 0.88)
+    avail_act_bytes = max(act_bytes_per_sample, target_usable_bytes - static_memory_bytes - cuda_overhead_bytes)
 
-    # 5. Micro-Batch Size Selection (largest safe power of 2)
-    candidate_batches = [64, 32, 16, 8, 4, 2, 1]
+    # 5. Micro-Batch Size Selection (granular descent to fill available headroom)
+    candidate_batches = [
+        256, 192, 160, 128, 112, 96, 80, 64, 48, 32, 24, 16, 12, 8, 4, 2, 1
+    ]
     batch_size = 1
     for cand in candidate_batches:
-        # Require activation memory to comfortably fit in available headroom (80% safety margin)
-        if cand * act_bytes_per_sample <= max(avail_act_bytes * 0.80, act_bytes_per_sample):
+        if cand * act_bytes_per_sample <= avail_act_bytes:
             batch_size = cand
             break
 
