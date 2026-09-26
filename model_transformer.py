@@ -155,6 +155,9 @@ class CausalSelfAttention(nn.Module):
             mask = mask & window_mask.view(1, 1, token_count, key_count)
 
         if self.attention_backend == "sdpa" and hasattr(F, "scaled_dot_product_attention"):
+            q_sdpa = query.contiguous()
+            k_sdpa = expanded_key.contiguous()
+            v_sdpa = expanded_val.contiguous()
             if self.attention_window <= 0 and past_kv is None:
                 # Plain full-sequence causal attention (the common training
                 # case): the mask built above is mathematically identical to
@@ -164,18 +167,18 @@ class CausalSelfAttention(nn.Module):
                 # to the slower/more memory-hungry "efficient" or "math"
                 # backends even when the SDPA/Flash backend is selected.
                 y = F.scaled_dot_product_attention(
-                    query,
-                    expanded_key,
-                    expanded_val,
+                    q_sdpa,
+                    k_sdpa,
+                    v_sdpa,
                     is_causal=True,
                     dropout_p=self.attn_dropout.p if self.training else 0.0,
                 )
             else:
-                attn_mask = mask[:, :, :, :].bool()
+                attn_mask = mask[:, :, :, :].bool().contiguous()
                 y = F.scaled_dot_product_attention(
-                    query,
-                    expanded_key,
-                    expanded_val,
+                    q_sdpa,
+                    k_sdpa,
+                    v_sdpa,
                     attn_mask=attn_mask,
                     dropout_p=self.attn_dropout.p if self.training else 0.0,
                 )
